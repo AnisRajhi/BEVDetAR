@@ -146,7 +146,7 @@ def gaussian_radius(
 
     r3 = (
         b3 + sq3
-    ) / (2.0 * a3)
+    ) / 2.0
 
     return min(
         r1,

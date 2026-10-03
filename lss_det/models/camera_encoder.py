@@ -1,89 +1,132 @@
 #!/usr/bin/env python3
 
-from typing import Tuple, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from efficientnet_pytorch import EfficientNet
 
 
+# ==============================================================
+# GroupNorm utility
+# ==============================================================
+
+def make_group_norm(
+    num_channels: int,
+) -> nn.GroupNorm:
+    """
+    Choisit automatiquement un nombre de groupes valide.
+
+    On privilégie 32 groupes, puis 16, 8, ...
+    """
+
+    for num_groups in [
+        32,
+        16,
+        8,
+        4,
+        2,
+        1,
+    ]:
+
+        if (
+            num_channels
+            % num_groups
+            == 0
+        ):
+
+            return nn.GroupNorm(
+                num_groups=num_groups,
+                num_channels=num_channels,
+            )
+
+    raise RuntimeError(
+        f"Could not create GroupNorm "
+        f"for {num_channels} channels."
+    )
+
+
+# ==============================================================
+# Feature Fusion
+# ==============================================================
+
 class FeatureFusion(nn.Module):
     """
-    Fusion des features multi-échelles d'EfficientNet-B0.
+    Fusion de:
 
-    Entrées
-    -------
-    reduction_4:
-        [M, 112, H/16, W/16]
+        EfficientNet reduction_4
+            [B*N,112,8,22]
 
-    reduction_5:
-        [M, 320, H/32, W/32]
+    et:
 
-    où:
-        M = B * N
+        EfficientNet reduction_5
+            [B*N,320,4,11]
 
-    Sortie
-    ------
-    [M, 512, H/16, W/16]
+    Sortie:
+
+        [B*N,512,8,22]
+
+
+    IMPORTANT
+    ---------
+
+    On utilise GroupNorm et non BatchNorm.
+
+    GroupNorm ne dépend pas du batch size.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        out_channels: int = 512,
+    ):
         super().__init__()
 
-        # reduction_5 est deux fois plus petite spatialement que reduction_4.
-        #
-        # Exemple:
-        #   reduction_4 = [M, 112, 8, 22]
-        #   reduction_5 = [M, 320, 4, 11]
-        #
-        # On remonte reduction_5 vers 8x22.
-        self.upsample = nn.Upsample(
-            scale_factor=2,
-            mode="bilinear",
-            align_corners=True,
+        self.out_channels = (
+            out_channels
         )
-        # UPSAMPLE : No trainable param ! → Unlike Transpose
 
-        # Après upsample:
-        #
-        #   reduction_4          : 112 channels
-        #   reduction_5 upsample : 320 channels
-        #
-        # concaténation:
-        #
-        #   112 + 320 = 432 channels
-        #
-        # Puis on transforme les 432 channels vers 512 channels.
-    
         self.fusion = nn.Sequential(
+
+            # --------------------------------------------------
+            # 112 + 320 = 432 channels
+            # --------------------------------------------------
+
             nn.Conv2d(
-                in_channels=112 + 320,
+                in_channels=(
+                    112 + 320
+                ),
                 out_channels=512,
                 kernel_size=3,
                 padding=1,
                 bias=False,
             ),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
+
+            make_group_norm(
+                512
+            ),
+
+            nn.ReLU(
+                inplace=True
+            ),
 
             nn.Conv2d(
                 in_channels=512,
-                out_channels=512,
+                out_channels=out_channels,
                 kernel_size=3,
                 padding=1,
                 bias=False,
             ),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
+
+            make_group_norm(
+                out_channels
+            ),
+
+            nn.ReLU(
+                inplace=True
+            ),
         )
-        #Pourquoi les deux conv2 3x3:
-        #La convolution permet d'apprendre :
-        #    432 channels
-        #        ↓
-        #    combinaisons utiles
-        #        ↓
-        #    512 nouvelles features
 
     def forward(
         self,
@@ -91,199 +134,288 @@ class FeatureFusion(nn.Module):
         reduction_5: torch.Tensor,
     ) -> torch.Tensor:
 
-        # --------------------------------------------------------------
-        # 1. Upsample reduction_5
-        # --------------------------------------------------------------
-        #
-        # [M, 320, H/32, W/32]
-        #
-        #       ↓
-        #
-        # [M, 320, H/16, W/16]
-        #
-        reduction_5_up = self.upsample(reduction_5)
+        # ======================================================
+        # Upsample deep EfficientNet features
+        # ======================================================
 
-        # Sécurité:
-        # les dimensions spatiales doivent maintenant être identiques.
-        if reduction_5_up.shape[-2:] != reduction_4.shape[-2:]:
-            raise RuntimeError(
-                "Spatial size mismatch during feature fusion:\n"
-                f"  reduction_4    : {reduction_4.shape}\n"
-                f"  reduction_5_up : {reduction_5_up.shape}"
-            )
+        reduction_5 = F.interpolate(
 
-        # --------------------------------------------------------------
-        # 2. Concaténation sur l'axe des channels
-        # --------------------------------------------------------------
-        #
-        # reduction_4:
-        # [M, 112, H/16, W/16]
-        #
-        # reduction_5_up:
-        # [M, 320, H/16, W/16]
-        #
-        # résultat:
-        # [M, 432, H/16, W/16]
-        #
+            reduction_5,
+
+            size=reduction_4.shape[
+                -2:
+            ],
+
+            mode="bilinear",
+
+            align_corners=True,
+        )
+
+        # ======================================================
+        # Concatenate
+        # ======================================================
+
         x = torch.cat(
-            [reduction_4, reduction_5_up],
+            [
+                reduction_4,
+                reduction_5,
+            ],
             dim=1,
         )
 
-        # --------------------------------------------------------------
-        # 3. Fusion CNN
-        # --------------------------------------------------------------
-        #
-        # [M, 432, H/16, W/16]
-        #
-        #        ↓
-        #
-        # [M, 512, H/16, W/16]
-        #
-        x = self.fusion(x)
+        # [BN,432,8,22]
+
+        x = self.fusion(
+            x
+        )
+
+        # [BN,512,8,22]
 
         return x
 
 
+# ==============================================================
+# Camera Encoder
+# ==============================================================
+
 class CameraEncoder(nn.Module):
     """
-    Camera Encoder multi-caméra basé sur EfficientNet-B0.
+    Shared camera encoder.
 
-    Le même réseau est partagé entre toutes les caméras.
-
-    Input
+    INPUT
     -----
-    images:
-        [B, N, 3, H, W]
 
-    Output
+        images:
+            [B,N,3,H,W]
+
+    OUTPUT
     ------
-    features:
-        [B, N, 512, H/16, W/16]
 
-    Exemple
-    -------
-    input:
-        [2, 4, 3, 128, 352]
+        [B,N,512,H/16,W/16]
 
-    output:
-        [2, 4, 512, 8, 22]
+
+    NORMALIZATION POLICY
+    --------------------
+
+    EfficientNet pretrained BatchNorm:
+        frozen in eval mode.
+
+    Our fusion layers:
+        GroupNorm.
+
+    EfficientNet DropConnect:
+        disabled.
+
+    Cela rend le CameraEncoder beaucoup plus robuste
+    lorsque le training utilise batch_size=1.
     """
 
     def __init__(
         self,
+        out_channels: int = 512,
         pretrained: bool = True,
         weights_path: Optional[str] = None,
+        freeze_backbone_bn: bool = True,
+        disable_drop_connect: bool = True,
     ):
         super().__init__()
 
-        # --------------------------------------------------------------
-        # EfficientNet-B0 backbone
-        # --------------------------------------------------------------
+        self.out_channels = int(
+            out_channels
+        )
+
+        self.freeze_backbone_bn = bool(
+            freeze_backbone_bn
+        )
+
+        # ======================================================
+        # EfficientNet-B0
+        # ======================================================
 
         if pretrained:
-            # Charge les poids ImageNet.
-            #
-            # Si weights_path est None:
-            # efficientnet_pytorch utilise/télécharge les poids standards.
-            #
-            # Si weights_path est fourni:
-            # on charge les poids depuis ce fichier.
-            self.backbone = EfficientNet.from_pretrained(
-                "efficientnet-b0",
-                weights_path=weights_path,
-            )
+
+            if weights_path is None:
+
+                self.backbone = (
+                    EfficientNet.from_pretrained(
+                        "efficientnet-b0"
+                    )
+                )
+
+            else:
+
+                self.backbone = (
+                    EfficientNet.from_pretrained(
+                        "efficientnet-b0",
+                        weights_path=weights_path,
+                    )
+                )
 
         else:
-            # Même architecture mais poids aléatoires.
-            self.backbone = EfficientNet.from_name(
-                "efficientnet-b0"
+
+            self.backbone = (
+                EfficientNet.from_name(
+                    "efficientnet-b0"
+                )
             )
 
-        # --------------------------------------------------------------
-        # Fusion reduction_4 + reduction_5
-        # --------------------------------------------------------------
+        # ======================================================
+        # Disable DropConnect / stochastic depth
+        # ======================================================
+        #
+        # EfficientNet utilise du drop-connect à l'intérieur
+        # des MBConv blocks en mode train().
+        #
+        # Pour notre petit batch et pour obtenir un comportement
+        # train/eval comparable, on le désactive.
+        #
+        # ======================================================
 
-        self.feature_fusion = FeatureFusion()
+        if disable_drop_connect:
 
-    def extract_backbone_features(
+            global_params = (
+                self.backbone
+                ._global_params
+            )
+
+            if hasattr(
+                global_params,
+                "_replace",
+            ):
+
+                self.backbone._global_params = (
+                    global_params._replace(
+                        drop_connect_rate=0.0
+                    )
+                )
+
+        # ======================================================
+        # Fusion
+        # ======================================================
+
+        self.fusion = FeatureFusion(
+            out_channels=out_channels
+        )
+
+        # ======================================================
+        # Freeze EfficientNet BN statistics
+        # ======================================================
+
+        if self.freeze_backbone_bn:
+
+            self._freeze_backbone_batchnorm()
+
+    # ==========================================================
+    # Freeze EfficientNet BatchNorm
+    # ==========================================================
+
+    def _freeze_backbone_batchnorm(
         self,
-        images: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ):
         """
-        Extrait les deux niveaux EfficientNet utilisés par LSS.
+        BatchNorm EfficientNet:
 
-        Input
-        -----
-        images:
-            [M, 3, H, W]
+            - reste en eval()
+            - running_mean / running_var ne changent plus
+            - gamma/beta sont également figés
 
-        Returns
-        -------
-        reduction_4:
-            [M, 112, H/16, W/16]
-
-        reduction_5:
-            [M, 320, H/32, W/32]
+        Les convolutions EfficientNet restent entraînables.
         """
 
-        # EfficientNet fournit directement plusieurs sorties
-        # intermédiaires avec extract_endpoints().
-        endpoints = self.backbone.extract_endpoints(images)
+        for module in (
+            self.backbone.modules()
+        ):
 
-        reduction_4 = endpoints["reduction_4"]
-        reduction_5 = endpoints["reduction_5"]
+            if isinstance(
+                module,
+                (
+                    nn.BatchNorm1d,
+                    nn.BatchNorm2d,
+                    nn.BatchNorm3d,
+                ),
+            ):
 
-        return reduction_4, reduction_5
+                module.eval()
+
+                if (
+                    module.weight
+                    is not None
+                ):
+
+                    module.weight.requires_grad_(
+                        False
+                    )
+
+                if (
+                    module.bias
+                    is not None
+                ):
+
+                    module.bias.requires_grad_(
+                        False
+                    )
+
+    # ==========================================================
+    # train()
+    # ==========================================================
+
+    def train(
+        self,
+        mode: bool = True,
+    ):
+        """
+        Le problème:
+
+            model.train()
+
+        remet normalement TOUTES les BatchNorm en train mode.
+
+        On surcharge donc train() pour laisser les BN
+        EfficientNet en eval mode.
+        """
+
+        super().train(
+            mode
+        )
+
+        if self.freeze_backbone_bn:
+
+            self._freeze_backbone_batchnorm()
+
+        return self
+
+    # ==========================================================
+    # Forward
+    # ==========================================================
 
     def forward(
         self,
         images: torch.Tensor,
     ) -> torch.Tensor:
 
-        # --------------------------------------------------------------
-        # Vérification de l'input
-        # --------------------------------------------------------------
-
         if images.ndim != 5:
+
             raise ValueError(
-                "CameraEncoder expects images with shape "
-                "[B, N, 3, H, W]. "
-                f"Received: {tuple(images.shape)}"
+                "CameraEncoder expects "
+                "[B,N,3,H,W]. "
+                f"Received "
+                f"{tuple(images.shape)}"
             )
 
-        B, N, C, H, W = images.shape
+        B, N, C, H, W = (
+            images.shape
+        )
 
         if C != 3:
+
             raise ValueError(
-                "CameraEncoder expects RGB images (C=3). "
-                f"Received C={C}"
+                "Expected RGB images."
             )
 
-        # --------------------------------------------------------------
-        # 1. Fusion temporaire Batch + Cameras
-        # --------------------------------------------------------------
-        #
-        # Input:
-        #
-        # [B, N, 3, H, W]
-        #
-        # Exemple:
-        #
-        # [2, 4, 3, 128, 352]
-        #
-        # On veut faire passer toutes les images dans le MÊME
-        # EfficientNet + C'est un NN classique qui attend [B, 3, H, W]
-        # Il connait pas le concept de multi-cam
-        #
-        # Donc:
-        #
-        # [B, N, 3, H, W]
-        #
-        #       ↓ reshape
-        #
-        # [B*N, 3, H, W]
-        #
+        # ======================================================
+        # Merge B and N
+        # ======================================================
+
         x = images.reshape(
             B * N,
             C,
@@ -291,109 +423,55 @@ class CameraEncoder(nn.Module):
             W,
         )
 
-        # --------------------------------------------------------------
-        # 2. EfficientNet
-        # --------------------------------------------------------------
+        # ======================================================
+        # EfficientNet
+        # ======================================================
 
-        reduction_4, reduction_5 = self.extract_backbone_features(x)
+        endpoints = (
+            self.backbone
+            .extract_endpoints(
+                x
+            )
+        )
 
-        # Pour H=128, W=352:
-        #
-        # reduction_4:
-        # [B*N, 112, 8, 22]
-        #
-        # reduction_5:
-        # [B*N, 320, 4, 11]
+        reduction_4 = endpoints[
+            "reduction_4"
+        ]
 
-        # --------------------------------------------------------------
-        # 3. Fusion multi-échelle
-        # --------------------------------------------------------------
+        reduction_5 = endpoints[
+            "reduction_5"
+        ]
 
-        features = self.feature_fusion(
+        # ======================================================
+        # Feature fusion
+        # ======================================================
+
+        features = self.fusion(
+
             reduction_4,
+
             reduction_5,
         )
 
-        # features:
-        #
-        # [B*N, 512, H/16, W/16]
-        #
-        # Exemple:
-        #
-        # [B*N, 512, 8, 22]
-
-        # --------------------------------------------------------------
-        # 4. Restaurer la dimension Camera N
-        # --------------------------------------------------------------
-
-        _, C_out, H_out, W_out = features.shape
-
-        features = features.reshape(
-            B,
-            N,
-            C_out,
-            H_out,
-            W_out,
+        _, Cout, Hf, Wf = (
+            features.shape
         )
 
-        # Final:
-        #
-        # [B, N, 512, H/16, W/16]
+        # ======================================================
+        # Restore B/N
+        # ======================================================
+
+        features = features.reshape(
+
+            B,
+
+            N,
+
+            Cout,
+
+            Hf,
+
+            Wf,
+        )
 
         return features
-
-
-# ----------------------------------------------------------------------
-# Test rapide lorsqu'on lance directement le fichier
-# ----------------------------------------------------------------------
-
-if __name__ == "__main__":
-
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
-
-    print(f"Device: {device}")
-
-    # Pour éviter de télécharger les poids lors de ce simple test:
-    encoder = CameraEncoder(
-        pretrained=False
-    ).to(device)
-
-    # Exemple:
-    #
-    # B = 2 samples
-    # N = 4 cameras
-    # RGB
-    # H = 128
-    # W = 352
-    images = torch.randn(
-        2,
-        4,
-        3,
-        128,
-        352,
-        device=device,
-    )
-
-    print(f"Input shape : {images.shape}")
-
-    with torch.no_grad():
-        features = encoder(images)
-
-    print(f"Output shape: {features.shape}")
-
-    expected_shape = (
-        2,
-        4,
-        512,
-        8,
-        22,
-    )
-
-    assert features.shape == expected_shape, (
-        f"Expected {expected_shape}, "
-        f"got {tuple(features.shape)}"
-    )
-
-    print("CameraEncoder test PASSED")

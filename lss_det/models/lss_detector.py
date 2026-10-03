@@ -199,8 +199,16 @@ class LSSDetector(nn.Module):
         #
 
         self.camera_encoder = CameraEncoder(
+
+            out_channels=self.camera_feature_channels,
+
             pretrained=camera_pretrained,
+
             weights_path=camera_weights_path,
+
+            freeze_backbone_bn=True,
+
+            disable_drop_connect=True,
         )
 
         # ==========================================================
