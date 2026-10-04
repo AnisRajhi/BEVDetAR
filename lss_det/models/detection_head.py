@@ -93,15 +93,30 @@ class PredictionHead(nn.Module):
         # ======================================================
         # Final conv initialization
         # ======================================================
+        #
+        # v2 : la heatmap (final_bias != 0) garde l'init PyTorch par
+        # défaut, comme CenterPoint. Seul le biais vaut -2.19.
+        #
+        # Avec std=0.001, le premier pas d'Adam (~lr par poids) rend
+        # TOUS les poids négatifs : les ~100 000 cellules de fond
+        # dominent et les features post-ReLU sont >= 0 partout. Toute
+        # activation au centre d'un objet baisse alors son score, le
+        # réseau éteint ces features (ReLU morte) et la probabilité aux
+        # centres GT reste bloquée à sigmoid(-2.19) = 0.10.
+        # Mesuré à lr 2e-4 : GTp 0.10 -> 0.10 en 100 pas (std 0.001)
+        # contre 0.13 -> 0.62 (init par défaut).
+        #
+        # Les têtes de régression (L1 aux seuls centres GT, sans
+        # fond) ne sont pas concernées et gardent std=0.001.
+        #
+        # ======================================================
 
-        nn.init.normal_(
-
-            self.net[-1].weight,
-
-            mean=0.0,
-
-            std=0.001,
-        )
+        if final_bias == 0.0:
+            nn.init.normal_(
+                self.net[-1].weight,
+                mean=0.0,
+                std=0.001,
+            )
 
         nn.init.constant_(
 

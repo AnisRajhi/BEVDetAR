@@ -1,609 +1,84 @@
 #!/usr/bin/env python3
+"""
+Geometry LSS : frustum (u, v, d) -> points 3D dans le repère BEV.
 
-from typing import Tuple
+Corrections par rapport à la v1
+-------------------------------
+1. Position des rayons.
+   v1 : u = linspace(0, W-1, Wf)  ->  u_j = j * (W-1)/(Wf-1)
+   Une cellule de feature (stride 16) correspond pourtant au bloc de
+   pixels [16 j, 16 j + 15], centré en 16 j + 7.5. L'écart allait de
+   -7.5 px (bord gauche) à +7.5 px (bord droit) : ~1.5° de biais
+   angulaire, soit ~1 m latéral à 40 m, systématique par colonne et
+   impossible à corriger par le réseau (la géométrie est figée).
+   Ici : u_j = 16 j + 7.5, v_i = 16 i + 7.5. C'est aussi exactement la
+   convention des labels de profondeur lidar.
+
+2. Profondeur au CENTRE du bin (d_min + (k + 0.5) * pas), cohérent avec
+   le label de bin floor((d - d_min) / pas).
+
+3. BEV Data Augmentation : P_bev = bda @ P_ego.
+
+`image_to_ego()` est exposé pour pouvoir tester la chaîne géométrique
+complète (projection lidar <-> déprojection frustum) point par point.
+"""
+
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 
 class Geometry(nn.Module):
-    """
-    LSS geometry module.
-
-    Ce module construit un frustum fixe (u, v, d), puis convertit
-    chaque hypothèse en une coordonnée 3D dans le repère ego/robot.
-
-    ------------------------------------------------------------------
-    FRUSTUM
-    ------------------------------------------------------------------
-
-    [D, Hf, Wf, 3]
-
-    avec:
-        3 = (u, v, d)
-
-    Exemple:
-        D  = 41
-        Hf = 8
-        Wf = 22
-
-        frustum.shape = [41, 8, 22, 3]
-
-
-    ------------------------------------------------------------------
-    INPUTS forward()
-    ------------------------------------------------------------------
-
-    intrins:
-        [B, N, 3, 3]
-
-    rots:
-        [B, N, 3, 3]
-
-        Rotation caméra -> ego/robot.
-
-    trans:
-        [B, N, 3]
-
-        Translation caméra -> ego/robot.
-
-    post_rots:
-        [B, N, 3, 3]
-
-        Transformations appliquées aux coordonnées image
-        lors du preprocessing.
-
-    post_trans:
-        [B, N, 3]
-
-
-    ------------------------------------------------------------------
-    OUTPUT
-    ------------------------------------------------------------------
-
-    geometry:
-        [B, N, D, Hf, Wf, 3]
-
-    avec:
-        3 = (X, Y, Z) dans le repère ego/robot.
-    """
-
     def __init__(
         self,
-        image_size: Tuple[int, int] = (128, 352),
-        feature_size: Tuple[int, int] = (8, 22),
-        depth_bound: Tuple[float, float, float] = (
-            4.0,
-            45.0,
-            1.0,
-        ),
+        image_size: Tuple[int, int],
+        downsample: int,
+        depth_bound: Tuple[float, float, float],
     ):
         super().__init__()
-
-        self.image_h = int(image_size[0])
-        self.image_w = int(image_size[1])
-
-        self.feature_h = int(feature_size[0])
-        self.feature_w = int(feature_size[1])
-
-        self.depth_min = float(depth_bound[0])
-        self.depth_max = float(depth_bound[1])
-        self.depth_step = float(depth_bound[2])
-
-        # --------------------------------------------------------------
-        # Construction du frustum fixe
-        # --------------------------------------------------------------
-
-        frustum = self.create_frustum()
-
-        # register_buffer:
-        #
-        # - ce n'est PAS un paramètre appris
-        # - il suit automatiquement model.to("cuda")
-        # - il est sauvegardé dans le state_dict
-        #
-        self.register_buffer(
-            "frustum",
-            frustum,
-            persistent=True,
-        )
-
-    @property
-    def num_depth_bins(self) -> int:
-        """
-        Nombre de depth bins D.
-        """
-
-        return int(
-            (self.depth_max - self.depth_min)
-            / self.depth_step
-        )
+        self.image_h, self.image_w = int(image_size[0]), int(image_size[1])
+        self.downsample = int(downsample)
+        self.feature_h = self.image_h // self.downsample
+        self.feature_w = self.image_w // self.downsample
+        self.depth_min, self.depth_max, self.depth_step = (float(v) for v in depth_bound)
+        self.num_depth_bins = int(round((self.depth_max - self.depth_min) / self.depth_step))
+        self.register_buffer("frustum", self.create_frustum(), persistent=False)
 
     def create_frustum(self) -> torch.Tensor:
-        """
-        Construit le frustum fixe.
-
-        OUTPUT
-        ------
-        frustum:
-            [D, Hf, Wf, 3]
-
-        où:
-            frustum[d, v, u] = (u_image, v_image, depth)
-        """
-
-        # --------------------------------------------------------------
-        # 1. Depth candidates
-        # --------------------------------------------------------------
-        #
-        # Exemple:
-        #
-        # [4, 5, 6, ..., 44]
-        #
-        depths = torch.arange(
-            self.depth_min,
-            self.depth_max,
-            self.depth_step,
-            dtype=torch.float32,
-        )
-
-        D = depths.shape[0]
-
-        # [D]
-        #
-        #   ↓
-        #
-        # [D, 1, 1]
-        #
-        #   ↓ expand
-        #
-        # [D, Hf, Wf]
-        #
-        ds = depths.view(
-            D,
-            1,
-            1,
-        ).expand(
-            D,
-            self.feature_h,
-            self.feature_w,
-        )
-
-        # --------------------------------------------------------------
-        # 2. Horizontal image coordinates
-        # --------------------------------------------------------------
-        #
-        # On veut Wf positions réparties sur la largeur de l'image.
-        #
-        # Exemple:
-        #
-        # image width = 352
-        # feature width = 22
-        #
-        # xs contient 22 positions entre 0 et 351.
-        #
-        xs = torch.linspace(
-            0.0,
-            float(self.image_w - 1),
-            self.feature_w,
-            dtype=torch.float32,
-        )
-
-        # [Wf]
-        #
-        # ↓
-        #
-        # [1, 1, Wf]
-        #
-        # ↓
-        #
-        # [D, Hf, Wf]
-        #
-        xs = xs.view(
-            1,
-            1,
-            self.feature_w,
-        ).expand(
-            D,
-            self.feature_h,
-            self.feature_w,
-        )
-
-        # --------------------------------------------------------------
-        # 3. Vertical image coordinates
-        # --------------------------------------------------------------
-
-        ys = torch.linspace(
-            0.0,
-            float(self.image_h - 1),
-            self.feature_h,
-            dtype=torch.float32,
-        )
-
-        ys = ys.view(
-            1,
-            self.feature_h,
-            1,
-        ).expand(
-            D,
-            self.feature_h,
-            self.feature_w,
-        )
-
-        # --------------------------------------------------------------
-        # 4. Stack
-        # --------------------------------------------------------------
-        #
-        # xs : [D,Hf,Wf]
-        # ys : [D,Hf,Wf]
-        # ds : [D,Hf,Wf]
-        #
-        # ↓
-        #
-        # [D,Hf,Wf,3]
-        #
-        # 3 = (u,v,d)
-        #
-        frustum = torch.stack(
-            (
-                xs,
-                ys,
-                ds,
-            ),
-            dim=-1,
-        )
-
-        return frustum
+        D, Hf, Wf, s = self.num_depth_bins, self.feature_h, self.feature_w, self.downsample
+        ds = self.depth_min + (torch.arange(D, dtype=torch.float32) + 0.5) * self.depth_step
+        xs = torch.arange(Wf, dtype=torch.float32) * s + (s - 1) / 2.0
+        ys = torch.arange(Hf, dtype=torch.float32) * s + (s - 1) / 2.0
+        d, v, u = torch.meshgrid(ds, ys, xs, indexing="ij")
+        return torch.stack([u, v, d], dim=-1)        # [D, Hf, Wf, 3]
 
     @staticmethod
-    def _check_matrix_shape(
-        tensor: torch.Tensor,
-        expected_last_dims,
-        name: str,
-    ):
-        if tensor.shape[-len(expected_last_dims):] != expected_last_dims:
-            raise ValueError(
-                f"{name}: unexpected shape "
-                f"{tuple(tensor.shape)}. "
-                f"Expected last dimensions "
-                f"{expected_last_dims}."
-            )
-
-    def forward(
-        self,
-        intrins: torch.Tensor,
-        rots: torch.Tensor,
-        trans: torch.Tensor,
-        post_rots: torch.Tensor,
-        post_trans: torch.Tensor,
+    def image_to_ego(
+        uvd: torch.Tensor,          # [B, N, P, 3]  (u', v', profondeur) image AUGMENTÉE
+        intrins: torch.Tensor,      # [B, N, 3, 3]
+        rots: torch.Tensor,         # [B, N, 3, 3]  caméra -> ego
+        trans: torch.Tensor,        # [B, N, 3]
+        post_rots: torch.Tensor,    # [B, N, 3, 3]
+        post_trans: torch.Tensor,   # [B, N, 3]
+        bda: Optional[torch.Tensor] = None,   # [B, 3, 3]
     ) -> torch.Tensor:
+        # 1. annuler l'augmentation image
+        pts = uvd - post_trans[:, :, None, :]
+        pts = torch.einsum("bnij,bnpj->bnpi", torch.linalg.inv(post_rots), pts)
+        # 2. (u, v, d) -> (u d, v d, d)
+        pts = torch.cat([pts[..., :2] * pts[..., 2:3], pts[..., 2:3]], dim=-1)
+        # 3. caméra -> ego
+        combine = rots @ torch.linalg.inv(intrins)
+        pts = torch.einsum("bnij,bnpj->bnpi", combine, pts) + trans[:, :, None, :]
+        # 4. ego -> BEV augmenté
+        if bda is not None:
+            pts = torch.einsum("bij,bnpj->bnpi", bda, pts)
+        return pts
 
-        # --------------------------------------------------------------
-        # 0. Shape checks
-        # --------------------------------------------------------------
-
-        self._check_matrix_shape(
-            intrins,
-            (3, 3),
-            "intrins",
-        )
-
-        self._check_matrix_shape(
-            rots,
-            (3, 3),
-            "rots",
-        )
-
-        self._check_matrix_shape(
-            post_rots,
-            (3, 3),
-            "post_rots",
-        )
-
-        if trans.ndim != 3 or trans.shape[-1] != 3:
-            raise ValueError(
-                "trans must have shape [B,N,3]. "
-                f"Received {tuple(trans.shape)}"
-            )
-
-        if (
-            post_trans.ndim != 3
-            or post_trans.shape[-1] != 3
-        ):
-            raise ValueError(
-                "post_trans must have shape [B,N,3]. "
-                f"Received {tuple(post_trans.shape)}"
-            )
-
+    def forward(self, intrins, rots, trans, post_rots, post_trans, bda=None) -> torch.Tensor:
         B, N = intrins.shape[:2]
-
-        if rots.shape[:2] != (B, N):
-            raise ValueError(
-                "rots has different B/N dimensions."
-            )
-
-        if trans.shape[:2] != (B, N):
-            raise ValueError(
-                "trans has different B/N dimensions."
-            )
-
-        if post_rots.shape[:2] != (B, N):
-            raise ValueError(
-                "post_rots has different B/N dimensions."
-            )
-
-        if post_trans.shape[:2] != (B, N):
-            raise ValueError(
-                "post_trans has different B/N dimensions."
-            )
-
-        D = self.num_depth_bins
-        Hf = self.feature_h
-        Wf = self.feature_w
-
-        # --------------------------------------------------------------
-        # 1. Dupliquer virtuellement le frustum pour B et N
-        # --------------------------------------------------------------
-        #
-        # self.frustum:
-        #
-        # [D,Hf,Wf,3]
-        #
-        # ↓
-        #
-        # [1,1,D,Hf,Wf,3]
-        #
-        # ↓ expand
-        #
-        # [B,N,D,Hf,Wf,3]
-        #
-        points = self.frustum.to(
-            dtype=intrins.dtype,
-            device=intrins.device,
-        )
-
-        points = points.view(
-            1,
-            1,
-            D,
-            Hf,
-            Wf,
-            3,
-        ).expand(
-            B,
-            N,
-            D,
-            Hf,
-            Wf,
-            3,
-        )
-
-        # --------------------------------------------------------------
-        # 2. Undo post_trans
-        # --------------------------------------------------------------
-        #
-        # p_aug = Rpost * p_original + tpost
-        #
-        # Donc:
-        #
-        # p_original =
-        #     Rpost^-1 * (p_aug - tpost)
-        #
-        points = points - post_trans.view(
-            B,
-            N,
-            1,
-            1,
-            1,
-            3,
-        )
-
-        # --------------------------------------------------------------
-        # 3. Undo post_rots
-        # --------------------------------------------------------------
-
-        inv_post_rots = torch.linalg.inv(
-            post_rots
-        )
-
-        # points:
-        #
-        # [B,N,D,Hf,Wf,3]
-        #
-        # ↓ unsqueeze
-        #
-        # [B,N,D,Hf,Wf,3,1]
-        #
-        points = torch.matmul(
-            inv_post_rots.view(
-                B,
-                N,
-                1,
-                1,
-                1,
-                3,
-                3,
-            ),
-            points.unsqueeze(-1),
-        ).squeeze(-1)
-
-        # Ici points contient de nouveau:
-        #
-        # (u_original, v_original, d)
-
-        # --------------------------------------------------------------
-        # 4. Transformer (u,v,d) en (u*d, v*d, d)
-        # --------------------------------------------------------------
-        #
-        # Pour la rétroprojection pinhole:
-        #
-        # P_camera =
-        #
-        # K^-1 @
-        #
-        # [u*d]
-        # [v*d]
-        # [ d ]
-        #
-        uv = points[..., 0:2]
-        depth = points[..., 2:3]
-
-        points = torch.cat(
-            (
-                uv * depth,
-                depth,
-            ),
-            dim=-1,
-        )
-
-        # Maintenant:
-        #
-        # points = (u*d, v*d, d)
-
-        # --------------------------------------------------------------
-        # 5. Pixel -> camera XYZ
-        #
-        # puis camera -> robot XYZ
-        # --------------------------------------------------------------
-        #
-        # Pcam =
-        #
-        # K^-1 @ [u*d, v*d, d]
-        #
-        #
-        # Probot =
-        #
-        # R @ Pcam + t
-        #
-        #
-        # donc:
-        #
-        # Probot =
-        #
-        # R @ K^-1 @ pixel_depth + t
-        #
-        inv_intrins = torch.linalg.inv(
-            intrins
-        )
-
-        camera_to_robot_projection = torch.matmul(
-            rots,
-            inv_intrins,
-        )
-
-        # Shape:
-        #
-        # [B,N,3,3]
-        #
-        # ↓
-        #
-        # [B,N,1,1,1,3,3]
-        #
-        geometry = torch.matmul(
-            camera_to_robot_projection.view(
-                B,
-                N,
-                1,
-                1,
-                1,
-                3,
-                3,
-            ),
-            points.unsqueeze(-1),
-        ).squeeze(-1)
-
-        # --------------------------------------------------------------
-        # 6. Ajouter la translation caméra -> robot
-        # --------------------------------------------------------------
-
-        geometry = geometry + trans.view(
-            B,
-            N,
-            1,
-            1,
-            1,
-            3,
-        )
-
-        # --------------------------------------------------------------
-        # OUTPUT
-        # --------------------------------------------------------------
-        #
-        # [B,N,D,Hf,Wf,3]
-        #
-        # 3 = (X,Y,Z) robot/ego
-        #
-        return geometry
-
-
-if __name__ == "__main__":
-
-    geometry_module = Geometry(
-        image_size=(128, 352),
-        feature_size=(8, 22),
-        depth_bound=(4.0, 45.0, 1.0),
-    )
-
-    B = 2
-    N = 4
-
-    # Calibration artificielle simple.
-    intrins = torch.eye(3).view(
-        1, 1, 3, 3
-    ).repeat(
-        B, N, 1, 1
-    )
-
-    rots = torch.eye(3).view(
-        1, 1, 3, 3
-    ).repeat(
-        B, N, 1, 1
-    )
-
-    trans = torch.zeros(
-        B,
-        N,
-        3,
-    )
-
-    post_rots = torch.eye(3).view(
-        1, 1, 3, 3
-    ).repeat(
-        B, N, 1, 1
-    )
-
-    post_trans = torch.zeros(
-        B,
-        N,
-        3,
-    )
-
-    xyz = geometry_module(
-        intrins,
-        rots,
-        trans,
-        post_rots,
-        post_trans,
-    )
-
-    print("Frustum:", geometry_module.frustum.shape)
-
-    print("Geometry:", xyz.shape)
-
-    assert geometry_module.frustum.shape == (
-        41,
-        8,
-        22,
-        3,
-    )
-
-    assert xyz.shape == (
-        B,
-        N,
-        41,
-        8,
-        22,
-        3,
-    )
-
-    print("Geometry basic test PASSED")
+        D, Hf, Wf = self.frustum.shape[:3]
+        uvd = self.frustum.to(intrins.dtype).reshape(1, 1, -1, 3).expand(B, N, -1, 3)
+        pts = self.image_to_ego(uvd, intrins, rots, trans, post_rots, post_trans, bda)
+        return pts.reshape(B, N, D, Hf, Wf, 3)

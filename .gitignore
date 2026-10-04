@@ -206,3 +206,5 @@ cmake-build-*/
 
 core
 core.*
+*.pyc
+checkpoints/*.pt

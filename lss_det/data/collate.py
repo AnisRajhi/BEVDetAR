@@ -4,96 +4,23 @@ from typing import Dict, List
 
 import torch
 
+STACKED_KEYS = (
+    "images", "intrins", "rots", "trans", "post_rots", "post_trans", "bda", "depth_bins",
+)
+LIST_KEYS = ("gt_boxes", "gt_labels", "sample_token")
 
-def lss_collate_fn(
-    batch: List[Dict],
-) -> Dict:
 
-    if len(batch) == 0:
+def lss_collate_fn(batch: List[Dict]) -> Dict:
+    if not batch:
+        raise ValueError("Cannot collate empty batch.")
+    out = {k: torch.stack([item[k] for item in batch], dim=0) for k in STACKED_KEYS}
+    for k in LIST_KEYS:
+        out[k] = [item[k] for item in batch]
+    return out
 
-        raise ValueError(
-            "Cannot collate empty batch."
-        )
 
-    # ==============================================================
-    # Fixed-size tensors
-    # ==============================================================
+MODEL_INPUT_KEYS = ("images", "intrins", "rots", "trans", "post_rots", "post_trans", "bda")
 
-    output = {
-        "images": torch.stack(
-            [
-                item["images"]
-                for item in batch
-            ],
-            dim=0,
-        ),
 
-        "intrins": torch.stack(
-            [
-                item["intrins"]
-                for item in batch
-            ],
-            dim=0,
-        ),
-
-        "rots": torch.stack(
-            [
-                item["rots"]
-                for item in batch
-            ],
-            dim=0,
-        ),
-
-        "trans": torch.stack(
-            [
-                item["trans"]
-                for item in batch
-            ],
-            dim=0,
-        ),
-
-        "post_rots": torch.stack(
-            [
-                item["post_rots"]
-                for item in batch
-            ],
-            dim=0,
-        ),
-
-        "post_trans": torch.stack(
-            [
-                item["post_trans"]
-                for item in batch
-            ],
-            dim=0,
-        ),
-    }
-
-    # ==============================================================
-    # Variable number of objects
-    # ==============================================================
-
-    output[
-        "gt_boxes"
-    ] = [
-        item["gt_boxes"]
-        for item in batch
-    ]
-
-    output[
-        "gt_labels"
-    ] = [
-        item["gt_labels"]
-        for item in batch
-    ]
-
-    # Metadata.
-
-    output[
-        "sample_token"
-    ] = [
-        item["sample_token"]
-        for item in batch
-    ]
-
-    return output
+def model_inputs(batch: Dict, device) -> Dict:
+    return {k: batch[k].to(device, non_blocking=True) for k in MODEL_INPUT_KEYS}

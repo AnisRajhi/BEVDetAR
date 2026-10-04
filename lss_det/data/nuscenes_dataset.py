@@ -1,814 +1,268 @@
 #!/usr/bin/env python3
+"""
+nuScenes -> LSSDetector.
+
+Changements majeurs par rapport à la v1
+---------------------------------------
+1. Filtrage des GT :
+     - boîtes sans aucun point lidar ni radar (objets totalement occultés)
+     - boîtes au-delà de la portée d'évaluation de leur classe
+   -> on ne demande plus l'impossible au détecteur.
+
+2. Augmentation image géométrique (resize / crop / flip / rotation),
+   propagée exactement dans post_rot / post_trans.
+
+3. BEV Data Augmentation : matrice `bda` [3,3] renvoyée au modèle et
+   appliquée aux GT.
+
+4. Labels de profondeur lidar par caméra, à la résolution des features :
+   `depth_bins` [N, Hf, Wf] (-1 = pas de label).
+
+Sortie d'un sample
+------------------
+images      [N,3,H,W]
+intrins     [N,3,3]
+rots        [N,3,3]   caméra -> ego de référence (SANS bda)
+trans       [N,3]
+post_rots   [N,3,3]
+post_trans  [N,3]
+bda         [3,3]
+depth_bins  [N,Hf,Wf]
+gt_boxes    [M,7]     [x,y,z,l,w,h,yaw] dans le repère BEV (AVEC bda)
+gt_labels   [M]
+sample_token
+"""
 
 import math
-from typing import Dict, List, Optional, Sequence
+import os
+from typing import Dict, Optional, Sequence
 
 import numpy as np
 import torch
-
 from PIL import Image
 from pyquaternion import Quaternion
 from torch.utils.data import Dataset
 
-from nuscenes.nuscenes import NuScenes
-from nuscenes.utils.splits import (
-    create_splits_scenes,
-)
-
-from lss_det.data.transforms import (
-    LSSImageTransform,
-)
+from lss_det import config as C
+from lss_det.data.bev_augmentation import apply_bda_to_boxes, sample_bda
+from lss_det.data.depth_targets import build_depth_target, transform_points
+from lss_det.data.transforms import LSSImageAugmentation
 
 
-DEFAULT_CAMERAS = [
-    "CAM_FRONT",
-    "CAM_FRONT_RIGHT",
-    "CAM_BACK_RIGHT",
-    "CAM_BACK",
-    "CAM_BACK_LEFT",
-    "CAM_FRONT_LEFT",
-]
-
-
-DEFAULT_CLASSES = [
-    "car",
-    "truck",
-    "bus",
-    "pedestrian",
-    "bicycle",
-    "motorcycle",
-]
+def map_category(category_name: str) -> Optional[str]:
+    if category_name == "vehicle.car":
+        return "car"
+    if category_name == "vehicle.truck":
+        return "truck"
+    if category_name.startswith("vehicle.bus."):
+        return "bus"
+    if category_name.startswith("human.pedestrian."):
+        return "pedestrian"
+    if category_name == "vehicle.bicycle":
+        return "bicycle"
+    if category_name == "vehicle.motorcycle":
+        return "motorcycle"
+    return None
 
 
 class NuScenesLSSDataset(Dataset):
-    """
-    nuScenes adapter pour notre LSSDetector.
-
-    ==============================================================
-    OUTPUT sample
-    ==============================================================
-
-    images:
-        [N,3,H,W]
-
-    intrins:
-        [N,3,3]
-
-    rots:
-        [N,3,3]
-
-        camera -> reference ego
-
-    trans:
-        [N,3]
-
-    post_rots:
-        [N,3,3]
-
-    post_trans:
-        [N,3]
-
-    gt_boxes:
-        [M,7]
-
-        [x,y,z,l,w,h,yaw]
-
-    gt_labels:
-        [M]
-    """
-
     def __init__(
         self,
-        dataroot: str,
-        version: str = "v1.0-mini",
-        split: str = "train",
-        cameras: Sequence[str] = DEFAULT_CAMERAS,
-        classes: Sequence[str] = DEFAULT_CLASSES,
-        image_transform: Optional[
-            LSSImageTransform
-        ] = None,
+        split: str,
+        training: bool,
+        dataroot: str = C.DATAROOT,
+        version: str = C.VERSION,
+        cameras: Sequence[str] = C.CAMERAS,
+        classes: Sequence[str] = C.CLASSES,
+        use_lidar_depth: bool = True,
+        nusc=None,
         verbose: bool = False,
     ):
         super().__init__()
+        self.training = bool(training)
+        self.cameras = list(cameras)
+        self.classes = list(classes)
+        self.class_to_idx = {n: i for i, n in enumerate(self.classes)}
+        self.use_lidar_depth = bool(use_lidar_depth)
 
-        self.dataroot = dataroot
-        self.version = version
-
-        self.cameras = list(
-            cameras
+        self.image_aug = LSSImageAugmentation(
+            final_dim=C.IMAGE_SIZE,
+            training=self.training,
+            aug=C.IMG_AUG,
+            val_bot_pct=C.VAL_BOT_PCT,
         )
 
-        self.classes = list(
-            classes
-        )
+        if nusc is None:
+            from nuscenes.nuscenes import NuScenes
+            nusc = NuScenes(version=version, dataroot=os.path.expanduser(dataroot), verbose=verbose)
+        self.nusc = nusc
 
-        self.class_to_idx = {
-            name: i
-            for i, name
-            in enumerate(
-                self.classes
-            )
-        }
+        from nuscenes.utils.splits import create_splits_scenes
+        if version == "v1.0-mini" and split in ("train", "val"):
+            split = "mini_" + split
+        split_scenes = set(create_splits_scenes()[split])
 
-        if image_transform is None:
-
-            image_transform = (
-                LSSImageTransform(
-                    final_dim=(
-                        128,
-                        352,
-                    ),
-                    bottom_crop_pct=0.11,
-                    normalize=True,
-                )
-            )
-
-        self.image_transform = (
-            image_transform
-        )
-
-        # ==========================================================
-        # nuScenes API
-        # ==========================================================
-
-        self.nusc = NuScenes(
-            version=self.version,
-            dataroot=self.dataroot,
-            verbose=verbose,
-        )
-
-        # ==========================================================
-        # Split
-        # ==========================================================
-
-        self.split = (
-            self._resolve_split(
-                split
-            )
-        )
-
-        split_scenes = set(
-            create_splits_scenes()[
-                self.split
-            ]
-        )
-
-        # Garder uniquement les samples
-        # appartenant aux scènes du split.
-
-        self.samples = []
-
-        for sample in self.nusc.sample:
-
-            scene = self.nusc.get(
-                "scene",
-                sample[
-                    "scene_token"
-                ],
-            )
-
-            if (
-                scene["name"]
-                in split_scenes
-            ):
-
-                self.samples.append(
-                    sample
-                )
-
-        if len(self.samples) == 0:
-
-            raise RuntimeError(
-                f"No samples found for "
-                f"split={self.split}, "
-                f"version={self.version}"
-            )
-
-    # ==============================================================
-    # Split mapping
-    # ==============================================================
-
-    def _resolve_split(
-        self,
-        split: str,
-    ) -> str:
-
-        # On autorise:
-        #
-        # split="train"
-        #
-        # même avec v1.0-mini.
-
-        if self.version == "v1.0-mini":
-
-            if split == "train":
-                return "mini_train"
-
-            if split == "val":
-                return "mini_val"
-
-        return split
-
-    def __len__(
-        self,
-    ):
-
-        return len(
-            self.samples
-        )
-
-    # ==============================================================
-    # Category mapping
-    # ==============================================================
-
-    def _map_category(
-        self,
-        category_name: str,
-    ) -> Optional[int]:
-        """
-        nuScenes utilise des catégories détaillées:
-
-            vehicle.car
-            vehicle.bus.rigid
-            human.pedestrian.adult
-            ...
-
-        On les ramène vers nos classes simples.
-        """
-
-        mapped = None
-
-        if category_name == "vehicle.car":
-
-            mapped = "car"
-
-        elif category_name == "vehicle.truck":
-
-            mapped = "truck"
-
-        elif category_name.startswith(
-            "vehicle.bus."
-        ):
-
-            mapped = "bus"
-
-        elif category_name.startswith(
-            "human.pedestrian."
-        ):
-
-            mapped = "pedestrian"
-
-        elif category_name == (
-            "vehicle.bicycle"
-        ):
-
-            mapped = "bicycle"
-
-        elif category_name == (
-            "vehicle.motorcycle"
-        ):
-
-            mapped = "motorcycle"
-
-        if mapped is None:
-
-            return None
-
-        return self.class_to_idx.get(
-            mapped,
-            None,
-        )
-
-    # ==============================================================
-    # Reference ego pose
-    # ==============================================================
-
-    def _get_reference_pose(
-        self,
-        sample: Dict,
-    ):
-
-        """
-        On utilise LIDAR_TOP comme timestamp / ego frame
-        de référence pour la sample.
-        """
-
-        lidar_token = sample[
-            "data"
-        ][
-            "LIDAR_TOP"
+        self.samples = [
+            s for s in self.nusc.sample
+            if self.nusc.get("scene", s["scene_token"])["name"] in split_scenes
         ]
+        if not self.samples:
+            raise RuntimeError(f"Aucun sample pour split={split}, version={version}")
 
-        lidar_sd = self.nusc.get(
-            "sample_data",
-            lidar_token,
-        )
+        self.disable_augmentation = False
 
-        ego_pose = self.nusc.get(
-            "ego_pose",
-            lidar_sd[
-                "ego_pose_token"
-            ],
-        )
+    def __len__(self):
+        return len(self.samples)
 
-        # Ego reference -> global
-        R_ref_global = Quaternion(
-            ego_pose["rotation"]
-        ).rotation_matrix
+    # ==============================================================
+    # Poses
+    # ==============================================================
 
-        t_ref_global = np.asarray(
-            ego_pose[
-                "translation"
-            ],
-            dtype=np.float64,
-        )
+    def get_reference_pose(self, sample: Dict):
+        """Ego au timestamp LIDAR_TOP = repère de référence de la frame."""
+        lidar_sd = self.nusc.get("sample_data", sample["data"]["LIDAR_TOP"])
+        ego = self.nusc.get("ego_pose", lidar_sd["ego_pose_token"])
+        return Quaternion(ego["rotation"]).rotation_matrix, np.asarray(ego["translation"], dtype=np.float64)
 
-        return (
-            R_ref_global,
-            t_ref_global,
+    def get_camera_to_reference(self, camera_token: str, R_ref_global, t_ref_global):
+        """caméra -> ego(t_cam) -> global -> ego de référence."""
+        sd = self.nusc.get("sample_data", camera_token)
+        cs = self.nusc.get("calibrated_sensor", sd["calibrated_sensor_token"])
+        ego = self.nusc.get("ego_pose", sd["ego_pose_token"])
+
+        R_cam_ego = Quaternion(cs["rotation"]).rotation_matrix
+        t_cam_ego = np.asarray(cs["translation"], dtype=np.float64)
+        R_ego_glb = Quaternion(ego["rotation"]).rotation_matrix
+        t_ego_glb = np.asarray(ego["translation"], dtype=np.float64)
+
+        R_glb_ref = R_ref_global.T
+        R_cam_ref = R_glb_ref @ R_ego_glb @ R_cam_ego
+        t_cam_ref = R_glb_ref @ (R_ego_glb @ t_cam_ego + t_ego_glb - t_ref_global)
+        K = np.asarray(cs["camera_intrinsic"], dtype=np.float64)
+        return R_cam_ref, t_cam_ref, K
+
+    def get_lidar_points_reference(self, sample: Dict) -> np.ndarray:
+        """Nuage LIDAR_TOP de la keyframe, exprimé dans l'ego de référence."""
+        from nuscenes.utils.data_classes import LidarPointCloud
+
+        token = sample["data"]["LIDAR_TOP"]
+        sd = self.nusc.get("sample_data", token)
+        cs = self.nusc.get("calibrated_sensor", sd["calibrated_sensor_token"])
+        pc = LidarPointCloud.from_file(self.nusc.get_sample_data_path(token))
+        pts = pc.points[:3].T.astype(np.float64)
+        # Le lidar est capturé au timestamp de référence : lidar -> ego suffit.
+        return transform_points(
+            pts, Quaternion(cs["rotation"]).rotation_matrix, np.asarray(cs["translation"], dtype=np.float64)
         )
 
     # ==============================================================
-    # Camera calibration
+    # Annotations
     # ==============================================================
 
-    def _get_camera_to_reference(
-        self,
-        camera_token: str,
-        R_ref_global: np.ndarray,
-        t_ref_global: np.ndarray,
-    ):
+    def get_annotations(self, sample: Dict, R_ref_global, t_ref_global):
         """
-        Calcule:
-
-            camera optical frame
-                ↓
-            reference ego
-
-        en tenant compte du ego pose au timestamp caméra.
+        Retourne toutes les annotations des classes suivies, avec les
+        champs utiles au filtrage ET à l'audit.
         """
-
-        sample_data = self.nusc.get(
-            "sample_data",
-            camera_token,
-        )
-
-        calibrated_sensor = (
-            self.nusc.get(
-                "calibrated_sensor",
-                sample_data[
-                    "calibrated_sensor_token"
-                ],
-            )
-        )
-
-        camera_ego_pose = (
-            self.nusc.get(
-                "ego_pose",
-                sample_data[
-                    "ego_pose_token"
-                ],
-            )
-        )
-
-        # ----------------------------------------------------------
-        # Camera -> ego(camera timestamp)
-        # ----------------------------------------------------------
-
-        R_cam_ego = Quaternion(
-            calibrated_sensor[
-                "rotation"
-            ]
-        ).rotation_matrix
-
-        t_cam_ego = np.asarray(
-            calibrated_sensor[
-                "translation"
-            ],
-            dtype=np.float64,
-        )
-
-        # ----------------------------------------------------------
-        # Ego(camera timestamp) -> global
-        # ----------------------------------------------------------
-
-        R_ego_global = Quaternion(
-            camera_ego_pose[
-                "rotation"
-            ]
-        ).rotation_matrix
-
-        t_ego_global = np.asarray(
-            camera_ego_pose[
-                "translation"
-            ],
-            dtype=np.float64,
-        )
-
-        # ----------------------------------------------------------
-        # Global -> reference ego
-        # ----------------------------------------------------------
-
-        R_global_ref = (
-            R_ref_global.T
-        )
-
-        # ----------------------------------------------------------
-        # Rotation caméra -> reference ego
-        # ----------------------------------------------------------
-
-        R_cam_ref = (
-            R_global_ref
-            @ R_ego_global
-            @ R_cam_ego
-        )
-
-        # ----------------------------------------------------------
-        # Translation caméra -> reference ego
-        # ----------------------------------------------------------
-
-        camera_origin_global = (
-            R_ego_global
-            @ t_cam_ego
-            + t_ego_global
-        )
-
-        t_cam_ref = (
-            R_global_ref
-            @ (
-                camera_origin_global
-                - t_ref_global
-            )
-        )
-
-        # ----------------------------------------------------------
-        # Intrinsics
-        # ----------------------------------------------------------
-
-        intrinsic = np.asarray(
-            calibrated_sensor[
-                "camera_intrinsic"
-            ],
-            dtype=np.float64,
-        )
-
-        return (
-            R_cam_ref,
-            t_cam_ref,
-            intrinsic,
-            sample_data,
-        )
-
-    # ==============================================================
-    # GT boxes
-    # ==============================================================
-
-    def _get_gt(
-        self,
-        sample: Dict,
-        R_ref_global: np.ndarray,
-        t_ref_global: np.ndarray,
-    ):
-
-        boxes = []
-        labels = []
-
-        R_global_ref = (
-            R_ref_global.T
-        )
-
-        for annotation_token in sample[
-            "anns"
-        ]:
-
-            ann = self.nusc.get(
-                "sample_annotation",
-                annotation_token,
-            )
-
-            class_id = (
-                self._map_category(
-                    ann[
-                        "category_name"
-                    ]
-                )
-            )
-
-            # Classe non utilisée.
-            if class_id is None:
+        R_glb_ref = R_ref_global.T
+        out = []
+        for token in sample["anns"]:
+            ann = self.nusc.get("sample_annotation", token)
+            name = map_category(ann["category_name"])
+            if name is None or name not in self.class_to_idx:
                 continue
 
-            # ------------------------------------------------------
-            # Center global -> reference ego
-            # ------------------------------------------------------
+            center = R_glb_ref @ (np.asarray(ann["translation"], dtype=np.float64) - t_ref_global)
+            R_box = R_glb_ref @ Quaternion(ann["rotation"]).rotation_matrix
+            yaw = math.atan2(R_box[1, 0], R_box[0, 0])
+            w, l, h = (float(v) for v in ann["size"])   # nuScenes : [w, l, h]
 
-            center_global = np.asarray(
-                ann[
-                    "translation"
-                ],
-                dtype=np.float64,
-            )
+            vis = ann.get("visibility_token", "4")
+            out.append({
+                "name": name,
+                "label": self.class_to_idx[name],
+                "box": [float(center[0]), float(center[1]), float(center[2]), l, w, h, yaw],
+                "num_pts": int(ann.get("num_lidar_pts", 1)) + int(ann.get("num_radar_pts", 0)),
+                "visibility": int(vis) if str(vis).isdigit() else 4,
+                "distance": float(math.hypot(center[0], center[1])),
+            })
+        return out
 
-            center_ref = (
-                R_global_ref
-                @ (
-                    center_global
-                    - t_ref_global
-                )
-            )
+    @staticmethod
+    def keep_annotation(a: Dict) -> bool:
+        if C.FILTER_EMPTY_BOXES and a["num_pts"] <= 0:
+            return False
+        if a["visibility"] < C.MIN_VISIBILITY_LEVEL:
+            return False
+        if a["distance"] > C.CLASS_RANGE[a["name"]]:
+            return False
+        return True
 
-            # ------------------------------------------------------
-            # Orientation global -> reference ego
-            # ------------------------------------------------------
-
-            R_box_global = Quaternion(
-                ann[
-                    "rotation"
-                ]
-            ).rotation_matrix
-
-            R_box_ref = (
-                R_global_ref
-                @ R_box_global
-            )
-
-            # Notre convention:
-            #
-            # yaw=0:
-            # +X forward
-            #
-            # yaw positif:
-            # rotation CCW autour de +Z.
-
-            yaw = math.atan2(
-                R_box_ref[
-                    1,
-                    0,
-                ],
-                R_box_ref[
-                    0,
-                    0,
-                ],
-            )
-
-            # ------------------------------------------------------
-            # nuScenes size:
-            #
-            # [width, length, height]
-            #
-            # Notre convention:
-            #
-            # [length, width, height]
-            # ------------------------------------------------------
-
-            width = float(
-                ann["size"][0]
-            )
-
-            length = float(
-                ann["size"][1]
-            )
-
-            height = float(
-                ann["size"][2]
-            )
-
-            boxes.append(
-                [
-                    float(
-                        center_ref[0]
-                    ),
-                    float(
-                        center_ref[1]
-                    ),
-                    float(
-                        center_ref[2]
-                    ),
-                    length,
-                    width,
-                    height,
-                    yaw,
-                ]
-            )
-
-            labels.append(
-                class_id
-            )
-
-        if len(boxes) == 0:
-
-            gt_boxes = torch.empty(
-                (
-                    0,
-                    7,
-                ),
-                dtype=torch.float32,
-            )
-
-            gt_labels = torch.empty(
-                (
-                    0,
-                ),
-                dtype=torch.long,
-            )
-
-        else:
-
-            gt_boxes = torch.tensor(
-                boxes,
-                dtype=torch.float32,
-            )
-
-            gt_labels = torch.tensor(
-                labels,
-                dtype=torch.long,
-            )
-
-        return (
-            gt_boxes,
-            gt_labels,
-        )
+    def get_gt(self, sample: Dict, R_ref_global, t_ref_global):
+        anns = [a for a in self.get_annotations(sample, R_ref_global, t_ref_global) if self.keep_annotation(a)]
+        if not anns:
+            return torch.zeros((0, 7), dtype=torch.float32), torch.zeros((0,), dtype=torch.long)
+        boxes = torch.tensor([a["box"] for a in anns], dtype=torch.float32)
+        labels = torch.tensor([a["label"] for a in anns], dtype=torch.long)
+        return boxes, labels
 
     # ==============================================================
-    # Get item
+    # __getitem__
     # ==============================================================
 
-    def __getitem__(
-        self,
-        index: int,
-    ):
+    def __getitem__(self, index: int):
+        sample = self.samples[index]
+        augment = self.training and not self.disable_augmentation
 
-        sample = self.samples[
-            index
-        ]
+        # Graine dérivée du RNG torch : DataLoader la rend différente par
+        # worker et par itération, et reproductible avec torch.manual_seed.
+        rng = np.random.default_rng(int(torch.randint(0, 2**31 - 1, (1,)).item()))
+        self.image_aug.training = augment
 
-        # ==========================================================
-        # Reference frame
-        # ==========================================================
+        R_ref_global, t_ref_global = self.get_reference_pose(sample)
+        lidar_ref = self.get_lidar_points_reference(sample) if self.use_lidar_depth else None
 
-        (
-            R_ref_global,
-            t_ref_global,
-        ) = self._get_reference_pose(
-            sample
-        )
+        images, intrins, rots, trans, post_rots, post_trans, depth_bins = [], [], [], [], [], [], []
 
-        images = []
+        for cam in self.cameras:
+            token = sample["data"][cam]
+            R_cam_ref, t_cam_ref, K = self.get_camera_to_reference(token, R_ref_global, t_ref_global)
 
-        intrins = []
+            image = Image.open(self.nusc.get_sample_data_path(token))
+            img, post_rot, post_tran = self.image_aug(image, rng)
 
-        rots = []
+            images.append(img)
+            intrins.append(torch.from_numpy(K).float())
+            rots.append(torch.from_numpy(R_cam_ref).float())
+            trans.append(torch.from_numpy(t_cam_ref).float())
+            post_rots.append(post_rot)
+            post_trans.append(post_tran)
 
-        trans = []
-
-        post_rots = []
-
-        post_trans = []
-
-        # ==========================================================
-        # Cameras
-        # ==========================================================
-
-        for camera_name in self.cameras:
-
-            camera_token = sample[
-                "data"
-            ][
-                camera_name
-            ]
-
-            (
-                R_cam_ref,
-                t_cam_ref,
-                intrinsic,
-                sample_data,
-            ) = self._get_camera_to_reference(
-                camera_token,
-                R_ref_global,
-                t_ref_global,
-            )
-
-            # ------------------------------------------------------
-            # Image
-            # ------------------------------------------------------
-
-            image_path = (
-                self.nusc
-                .get_sample_data_path(
-                    camera_token
+            if lidar_ref is not None:
+                # ego de référence -> caméra : inverse de (R_cam_ref, t_cam_ref)
+                pts_cam = transform_points(lidar_ref, R_cam_ref.T, -R_cam_ref.T @ t_cam_ref)
+                bins, _ = build_depth_target(
+                    pts_cam, K, post_rot.numpy().astype(np.float64), post_tran.numpy().astype(np.float64),
+                    C.IMAGE_SIZE, C.DOWNSAMPLE, C.DEPTH_BOUND,
                 )
-            )
+                depth_bins.append(torch.from_numpy(bins))
+            else:
+                depth_bins.append(torch.full(C.FEATURE_SIZE, -1, dtype=torch.long))
 
-            image = Image.open(
-                image_path
-            )
-
-            (
-                image_tensor,
-                post_rot,
-                post_tran,
-            ) = self.image_transform(
-                image
-            )
-
-            images.append(
-                image_tensor
-            )
-
-            intrins.append(
-                torch.tensor(
-                    intrinsic,
-                    dtype=torch.float32,
-                )
-            )
-
-            rots.append(
-                torch.tensor(
-                    R_cam_ref,
-                    dtype=torch.float32,
-                )
-            )
-
-            trans.append(
-                torch.tensor(
-                    t_cam_ref,
-                    dtype=torch.float32,
-                )
-            )
-
-            post_rots.append(
-                post_rot
-            )
-
-            post_trans.append(
-                post_tran
-            )
-
-        # ==========================================================
-        # Stack cameras
-        # ==========================================================
-
-        images = torch.stack(
-            images,
-            dim=0,
-        )
-
-        intrins = torch.stack(
-            intrins,
-            dim=0,
-        )
-
-        rots = torch.stack(
-            rots,
-            dim=0,
-        )
-
-        trans = torch.stack(
-            trans,
-            dim=0,
-        )
-
-        post_rots = torch.stack(
-            post_rots,
-            dim=0,
-        )
-
-        post_trans = torch.stack(
-            post_trans,
-            dim=0,
-        )
-
-        # ==========================================================
-        # Ground truth
-        # ==========================================================
-
-        (
-            gt_boxes,
-            gt_labels,
-        ) = self._get_gt(
-            sample,
-            R_ref_global,
-            t_ref_global,
-        )
+        gt_boxes, gt_labels = self.get_gt(sample, R_ref_global, t_ref_global)
+        bda, _ = sample_bda(rng, C.BDA, training=augment)
+        gt_boxes = apply_bda_to_boxes(gt_boxes, bda)
 
         return {
-            "images": images,
-
-            "intrins": intrins,
-
-            "rots": rots,
-
-            "trans": trans,
-
-            "post_rots": post_rots,
-
-            "post_trans": post_trans,
-
+            "images": torch.stack(images),
+            "intrins": torch.stack(intrins),
+            "rots": torch.stack(rots),
+            "trans": torch.stack(trans),
+            "post_rots": torch.stack(post_rots),
+            "post_trans": torch.stack(post_trans),
+            "bda": bda,
+            "depth_bins": torch.stack(depth_bins),
             "gt_boxes": gt_boxes,
-
             "gt_labels": gt_labels,
-
-            "sample_token": sample[
-                "token"
-            ],
+            "sample_token": sample["token"],
         }
