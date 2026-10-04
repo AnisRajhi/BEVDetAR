@@ -20,7 +20,7 @@ import math
 # ==================================================================
 
 DATAROOT = "~/datasets/nuscenes"
-VERSION = "v1.0-mini"
+VERSION = "v1.0-trainval"
 
 CAMERAS = [
     "CAM_FRONT",
@@ -62,6 +62,14 @@ FILTER_EMPTY_BOXES = True
 # 1 = on garde tout (comportement de l'évaluation officielle).
 MIN_VISIBILITY_LEVEL = 1
 
+# Entraîner sur une PARTIE de nuScenes trainval :
+#   1. extraire les métadonnées v1.0-trainval + une ou plusieurs archives
+#      de blobs dans DATAROOT (dossiers samples/CAM_*, samples/LIDAR_TOP) ;
+#   2. VERSION = "v1.0-trainval" (splits officiels : 700 scènes train, 150 val).
+# Seules les frames dont les 6 images et le lidar existent sur le disque
+# sont gardées ; le nombre retenu est affiché à la construction du dataset.
+REQUIRE_AVAILABLE_FILES = True
+
 # ==================================================================
 # Image / caméra
 # ==================================================================
@@ -81,7 +89,7 @@ IMG_AUG = {
     "resize_lim": (0.90, 1.10),    # facteur relatif au resize de base
     "bot_pct_lim": (0.00, 0.22),   # fraction rognée en bas
     "rot_lim": (-5.4, 5.4),        # degrés
-    "rand_flip": True,
+    "rand_flip": False,
     "brightness": 0.2,
     "contrast": 0.2,
     "saturation": 0.2,
@@ -112,8 +120,8 @@ NY = int(round((YBOUND[1] - YBOUND[0]) / YBOUND[2]))
 BDA = {
     "rot_lim": (-22.5, 22.5),      # degrés
     "scale_lim": (0.95, 1.05),
-    "flip_x_prob": 0.5,
-    "flip_y_prob": 0.5,
+    "flip_x_prob": 0.0,
+    "flip_y_prob": 0.0,
 }
 
 # ==================================================================
@@ -163,13 +171,13 @@ NMS_RADIUS = {
 SEED = 42
 EPOCHS = 24
 BATCH_SIZE = 1
-ACCUM_STEPS = 2               # batch effectif = BATCH_SIZE * ACCUM_STEPS
+ACCUM_STEPS = 8               # batch effectif = BATCH_SIZE * ACCUM_STEPS
 NUM_WORKERS = 4
 LEARNING_RATE = 2e-4
 BACKBONE_LR_MULT = 0.1        # EfficientNet : LR x 0.1
 FREEZE_BACKBONE_BLOCKS = 0    # >0 : gèle le stem + les N premiers MBConv
 WEIGHT_DECAY = 1e-2           # AdamW : 1e-4 était quasiment nul (voir doc)
-WARMUP_STEPS = 200            # en pas d'optimiseur
+WARMUP_STEPS = 500            # en pas d'optimiseur
 MIN_LR_RATIO = 1e-3
 GRAD_CLIP = 35.0
 EVAL_EVERY = 2
@@ -181,7 +189,7 @@ OVERFIT_NUM_SAMPLES = 0
 OVERFIT_EPOCHS = 150
 OVERFIT_WARMUP_STEPS = 50
 OVERFIT_EVAL_EVERY = 25
-CHECKPOINT_DIR = "checkpoints"
+CHECKPOINT_DIR = "checkpoints_part01"
 
 
 # ==================================================================

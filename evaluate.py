@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 
 from lss_det import config as C
 from lss_det.data.collate import lss_collate_fn
-from lss_det.data.nuscenes_dataset import NuScenesLSSDataset
+from lss_det.data.nuscenes_dataset import NuScenesLSSDataset, release_nuscenes
 from lss_det.decoding.decode_boxes import CenterPointDecoder
 from lss_det.engine import evaluate, format_losses
 from lss_det.losses.detection_loss import DetectionLoss
@@ -39,6 +39,7 @@ def main():
     model.load_state_dict(ckpt["model_state_dict"])
 
     ds = NuScenesLSSDataset(split=SPLIT, training=False)
+    release_nuscenes()
     loader = DataLoader(ds, batch_size=C.BATCH_SIZE, shuffle=False, collate_fn=lss_collate_fn,
                         num_workers=C.NUM_WORKERS)
 

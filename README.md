@@ -32,6 +32,26 @@ python3 evaluate.py
 Mémoire GPU insuffisante : dans `config.py`, `IMAGE_SIZE = (128, 352)`.
 Les anciens checkpoints ne sont pas compatibles (architecture et grille BEV différentes).
 
+## Entraîner sur une partie de nuScenes trainval
+
+mini ne contient que 8 scènes d'entraînement et 2 de validation : la profondeur cesse de
+généraliser dès l'epoch 8 environ. Pour plus de diversité :
+
+1. Télécharger les **métadonnées v1.0-trainval** et **une ou plusieurs archives de blobs**
+   trainval (environ 85 scènes chacune ; des archives « keyframes » plus légères peuvent
+   exister, voir la page de téléchargement nuScenes). Les extraire dans `DATAROOT`.
+2. Dans `config.py` : `VERSION = "v1.0-trainval"`.
+3. `python3 audit_dataset.py`, puis `python3 train.py`.
+
+Le dataset ne garde que les frames dont les 6 images et le lidar sont présents, et affiche
+par exemple `v1.0-trainval / train : 2870/28130 frames disponibles sur disque, 71/700 scènes`.
+La validation utilise les scènes de val officielles présentes dans les archives téléchargées.
+
+Les métadonnées trainval décrivent les 850 scènes, quelle que soit la quantité de blobs
+téléchargée. Le dataset en extrait donc une fois des infos compactes par frame, puis
+`release_nuscenes()` libère l'objet NuScenes avant la création des workers du DataLoader :
+sinon chacun des `NUM_WORKERS` processus pourrait finir par en dupliquer la mémoire.
+
 ## Fichiers (intégration manuelle)
 
 **Nouveaux**
@@ -43,12 +63,14 @@ Les anciens checkpoints ne sont pas compatibles (architecture et grille BEV diff
 | `lss_det/data/bev_augmentation.py` | BDA : rotation, échelle, miroirs du repère BEV |
 | `lss_det/data/depth_targets.py` | labels de profondeur lidar par cellule de feature |
 | `audit_dataset.py` | audit des cibles, portées, visibilité, couverture lidar |
+| `print_history.py` | courbes d'apprentissage epoch par epoch depuis `history.pt` |
 | `tests/fake_nuscenes.py` | faux nuScenes réaliste pour les tests |
 | `tests/test_geometry_chain.py` | cohérence pixel ↔ frustum ↔ lidar ↔ BDA |
 | `tests/test_dataset_fake_nuscenes.py` | dataset de bout en bout |
 | `tests/test_model_targets_decode_metrics.py` | targets → décodage → métriques, forward/backward |
 | `tests/test_audit_and_engine.py` | audit + moteur train/eval |
 | `tests/test_heatmap_learnability.py` | garde-fou contre le piège « ReLU morte » de la heatmap |
+| `tests/test_available_files.py` | partie de trainval : fichiers absents, NuScenes partagé puis libéré |
 | `tests/__init__.py`, `lss_det/{data,decoding,losses,metrics,targets,visualization}/__init__.py` | packages |
 
 **Réécrits** (remplacer le fichier entier) :

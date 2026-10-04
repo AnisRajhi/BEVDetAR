@@ -29,7 +29,7 @@ import numpy as np
 
 from lss_det import config as C
 from lss_det.data.depth_targets import build_depth_target, transform_points
-from lss_det.data.nuscenes_dataset import NuScenesLSSDataset
+from lss_det.data.nuscenes_dataset import NuScenesLSSDataset, release_nuscenes
 from lss_det.data.transforms import LSSImageAugmentation
 
 SPLITS = ("train", "val")
@@ -95,16 +95,15 @@ def audit_split(split, nusc=None):
     focal = defaultdict(set)
     depth_cells = defaultdict(list)
 
-    for sample in ds.samples:
-        frames_per_scene[sample["scene_token"]] += 1
-        R_ref, t_ref = ds.get_reference_pose(sample)
+    for info in ds.infos:
+        frames_per_scene[info["scene_token"]] += 1
         cams = []
-        for cam in ds.cameras:
-            R, t, K = ds.get_camera_to_reference(sample["data"][cam], R_ref, t_ref)
+        for k, cam in enumerate(ds.cameras):
+            R, t, K = ds.get_camera_to_reference(info, k)
             cams.append((R, t, K))
             focal[cam].add(round(float(K[0, 0])))
 
-        for a in ds.get_annotations(sample, R_ref, t_ref):
+        for a in ds.get_annotations(info):
             name = a["name"]
             c = np.asarray(a["box"][:3])
             distances[name].append(a["distance"])
@@ -133,7 +132,7 @@ def audit_split(split, nusc=None):
                 n["reachable"] += dok
 
         if AUDIT_LIDAR:
-            lidar = ds.get_lidar_points_reference(sample)
+            lidar = ds.get_lidar_points_reference(info)
             for (R, t, K), cam in zip(cams, ds.cameras):
                 pts_cam = transform_points(lidar, R.T, -R.T @ t)
                 bins, _ = build_depth_target(pts_cam, K, post_new[0], post_new[1],
@@ -142,8 +141,10 @@ def audit_split(split, nusc=None):
 
     # ======================== rapport ========================
     print("=" * 78)
-    print(f"SPLIT {split} : {len(ds.samples)} frames, {len(frames_per_scene)} scènes "
-          f"({', '.join(str(v) for v in frames_per_scene.values())} frames/scène)")
+    fps = sorted(frames_per_scene.values())
+    detail = (", ".join(str(v) for v in frames_per_scene.values()) if len(fps) <= 12
+              else f"min {fps[0]}, médiane {fps[len(fps) // 2]}, max {fps[-1]}")
+    print(f"SPLIT {split} : {len(ds.infos)} frames, {len(frames_per_scene)} scènes ({detail} frames/scène)")
     print("=" * 78)
 
     print("\n[1] Cibles de la v1 (toutes les annotations dans ±50 m)")
@@ -202,6 +203,7 @@ def main(nusc_by_split=None):
     for split in SPLITS:
         nusc = nusc_by_split.get(split) if nusc_by_split else None
         results[split] = audit_split(split, nusc=nusc)
+    release_nuscenes()
     return results
 
 

@@ -28,7 +28,7 @@ from torch.utils.data import DataLoader, Subset
 
 from lss_det import config as C
 from lss_det.data.collate import lss_collate_fn
-from lss_det.data.nuscenes_dataset import NuScenesLSSDataset
+from lss_det.data.nuscenes_dataset import NuScenesLSSDataset, release_nuscenes
 from lss_det.decoding.decode_boxes import CenterPointDecoder
 from lss_det.engine import (config_snapshot, evaluate, format_losses, make_scheduler,
                             seed_everything, train_one_epoch)
@@ -60,6 +60,10 @@ def main():
     else:
         train_set = train_ds
         val_set = NuScenesLSSDataset(split="val", training=False)
+
+    # Les datasets ont extrait leurs infos : on libère NuScenes AVANT de
+    # créer les workers du DataLoader (sinon chaque worker en hérite).
+    release_nuscenes()
 
     epochs = C.OVERFIT_EPOCHS if overfit else C.EPOCHS
     accum = 1 if overfit else C.ACCUM_STEPS

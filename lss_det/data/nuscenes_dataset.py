@@ -18,6 +18,15 @@ Changements majeurs par rapport à la v1
 4. Labels de profondeur lidar par caméra, à la résolution des features :
    `depth_bins` [N, Hf, Wf] (-1 = pas de label).
 
+5. Infos compactes par frame (v2.1) : tout ce dont __getitem__ a besoin
+   (chemins, calibrations, poses, annotations) est extrait UNE fois à la
+   construction. L'objet NuScenes n'est pas conservé : en trainval, il
+   décrit 850 scènes même si une seule archive est téléchargée, et les
+   workers du DataLoader (fork) finiraient par en dupliquer la mémoire.
+
+6. Seules les frames dont les 6 images (et le lidar) existent sur le
+   disque sont gardées : on peut entraîner sur une partie de trainval.
+
 Sortie d'un sample
 ------------------
 images      [N,3,H,W]
@@ -33,6 +42,7 @@ gt_labels   [M]
 sample_token
 """
 
+import gc
 import math
 import os
 from typing import Dict, Optional, Sequence
@@ -65,6 +75,87 @@ def map_category(category_name: str) -> Optional[str]:
     return None
 
 
+# ==================================================================
+# Chargement partagé de NuScenes
+# ==================================================================
+
+_NUSC_CACHE = {}
+
+
+def get_nuscenes(version: str = C.VERSION, dataroot: str = C.DATAROOT, verbose: bool = False):
+    """Un seul chargement par (version, dataroot), partagé par train/val/audit."""
+    key = (version, os.path.abspath(os.path.expanduser(dataroot)))
+    if key not in _NUSC_CACHE:
+        from nuscenes.nuscenes import NuScenes
+        _NUSC_CACHE[key] = NuScenes(version=version, dataroot=key[1], verbose=verbose)
+    return _NUSC_CACHE[key]
+
+
+def release_nuscenes():
+    """
+    Libère les objets NuScenes chargés. À appeler une fois les datasets
+    construits et AVANT de créer les DataLoader (num_workers > 0).
+    """
+    _NUSC_CACHE.clear()
+    gc.collect()
+
+
+def _pose(record):
+    return Quaternion(record["rotation"]).rotation_matrix, np.asarray(record["translation"], dtype=np.float64)
+
+
+def build_sample_info(nusc, sample: Dict, cameras: Sequence[str], classes: Sequence[str], use_lidar: bool):
+    """
+    Extrait d'un sample nuScenes tout ce dont le dataset a besoin.
+    Retourne None si un fichier requis manque sur le disque.
+    """
+    paths = {}
+    for ch in list(cameras) + (["LIDAR_TOP"] if use_lidar else []):
+        path = nusc.get_sample_data_path(sample["data"][ch])
+        if C.REQUIRE_AVAILABLE_FILES and not os.path.exists(path):
+            return None
+        paths[ch] = path
+
+    lidar_sd = nusc.get("sample_data", sample["data"]["LIDAR_TOP"])
+    ref_R, ref_t = _pose(nusc.get("ego_pose", lidar_sd["ego_pose_token"]))
+    lidar_R, lidar_t = _pose(nusc.get("calibrated_sensor", lidar_sd["calibrated_sensor_token"]))
+
+    cams = []
+    for ch in cameras:
+        sd = nusc.get("sample_data", sample["data"][ch])
+        cs = nusc.get("calibrated_sensor", sd["calibrated_sensor_token"])
+        cs_R, cs_t = _pose(cs)
+        ego_R, ego_t = _pose(nusc.get("ego_pose", sd["ego_pose_token"]))
+        cams.append({
+            "path": paths[ch], "K": np.asarray(cs["camera_intrinsic"], dtype=np.float64),
+            "cs_R": cs_R, "cs_t": cs_t, "ego_R": ego_R, "ego_t": ego_t,
+        })
+
+    names, rows = [], []
+    for token in sample["anns"]:
+        ann = nusc.get("sample_annotation", token)
+        name = map_category(ann["category_name"])
+        if name is None or name not in classes:
+            continue
+        vis = ann.get("visibility_token", "4")
+        names.append(name)
+        # translation (3) | rotation quaternion w,x,y,z (4) | size w,l,h (3) | nb points | visibilité
+        rows.append(list(ann["translation"]) + list(ann["rotation"]) + list(ann["size"]) + [
+            int(ann.get("num_lidar_pts", 1)) + int(ann.get("num_radar_pts", 0)),
+            int(vis) if str(vis).isdigit() else 4,
+        ])
+
+    return {
+        "token": sample["token"],
+        "scene_token": sample["scene_token"],
+        "ref_R": ref_R, "ref_t": ref_t,
+        "lidar_path": paths.get("LIDAR_TOP"), "lidar_R": lidar_R, "lidar_t": lidar_t,
+        "cams": cams,
+        "ann_names": names,
+        "ann": np.asarray(rows, dtype=np.float64).reshape(-1, 12),
+    }
+
+
 class NuScenesLSSDataset(Dataset):
     def __init__(
         self,
@@ -93,97 +184,79 @@ class NuScenesLSSDataset(Dataset):
         )
 
         if nusc is None:
-            from nuscenes.nuscenes import NuScenes
-            nusc = NuScenes(version=version, dataroot=os.path.expanduser(dataroot), verbose=verbose)
-        self.nusc = nusc
+            nusc = get_nuscenes(version, dataroot, verbose)
 
         from nuscenes.utils.splits import create_splits_scenes
         if version == "v1.0-mini" and split in ("train", "val"):
             split = "mini_" + split
         split_scenes = set(create_splits_scenes()[split])
 
-        self.samples = [
-            s for s in self.nusc.sample
-            if self.nusc.get("scene", s["scene_token"])["name"] in split_scenes
+        candidates = [
+            s for s in nusc.sample
+            if nusc.get("scene", s["scene_token"])["name"] in split_scenes
         ]
-        if not self.samples:
-            raise RuntimeError(f"Aucun sample pour split={split}, version={version}")
+        infos = [build_sample_info(nusc, s, self.cameras, self.classes, True) for s in candidates]
+        self.infos = [i for i in infos if i is not None]
+        n_scenes = len({i["scene_token"] for i in self.infos})
+        n_all_scenes = len({s["scene_token"] for s in candidates})
+        print(f"[NuScenesLSSDataset] {version} / {split} : {len(self.infos)}/{len(candidates)} frames "
+              f"disponibles sur disque, {n_scenes}/{n_all_scenes} scènes")
+        if not self.infos:
+            raise RuntimeError(
+                f"Aucune frame utilisable pour split={split}, version={version}. Vérifie DATAROOT "
+                f"({dataroot}) et que les archives (samples/CAM_*, samples/LIDAR_TOP) y sont extraites."
+            )
 
         self.disable_augmentation = False
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.infos)
 
     # ==============================================================
-    # Poses
+    # Poses (à partir des infos compactes)
     # ==============================================================
 
-    def get_reference_pose(self, sample: Dict):
+    @staticmethod
+    def get_reference_pose(info: Dict):
         """Ego au timestamp LIDAR_TOP = repère de référence de la frame."""
-        lidar_sd = self.nusc.get("sample_data", sample["data"]["LIDAR_TOP"])
-        ego = self.nusc.get("ego_pose", lidar_sd["ego_pose_token"])
-        return Quaternion(ego["rotation"]).rotation_matrix, np.asarray(ego["translation"], dtype=np.float64)
+        return info["ref_R"], info["ref_t"]
 
-    def get_camera_to_reference(self, camera_token: str, R_ref_global, t_ref_global):
+    @staticmethod
+    def get_camera_to_reference(info: Dict, cam_index: int):
         """caméra -> ego(t_cam) -> global -> ego de référence."""
-        sd = self.nusc.get("sample_data", camera_token)
-        cs = self.nusc.get("calibrated_sensor", sd["calibrated_sensor_token"])
-        ego = self.nusc.get("ego_pose", sd["ego_pose_token"])
+        c = info["cams"][cam_index]
+        R_glb_ref = info["ref_R"].T
+        R_cam_ref = R_glb_ref @ c["ego_R"] @ c["cs_R"]
+        t_cam_ref = R_glb_ref @ (c["ego_R"] @ c["cs_t"] + c["ego_t"] - info["ref_t"])
+        return R_cam_ref, t_cam_ref, c["K"]
 
-        R_cam_ego = Quaternion(cs["rotation"]).rotation_matrix
-        t_cam_ego = np.asarray(cs["translation"], dtype=np.float64)
-        R_ego_glb = Quaternion(ego["rotation"]).rotation_matrix
-        t_ego_glb = np.asarray(ego["translation"], dtype=np.float64)
-
-        R_glb_ref = R_ref_global.T
-        R_cam_ref = R_glb_ref @ R_ego_glb @ R_cam_ego
-        t_cam_ref = R_glb_ref @ (R_ego_glb @ t_cam_ego + t_ego_glb - t_ref_global)
-        K = np.asarray(cs["camera_intrinsic"], dtype=np.float64)
-        return R_cam_ref, t_cam_ref, K
-
-    def get_lidar_points_reference(self, sample: Dict) -> np.ndarray:
+    @staticmethod
+    def get_lidar_points_reference(info: Dict) -> np.ndarray:
         """Nuage LIDAR_TOP de la keyframe, exprimé dans l'ego de référence."""
         from nuscenes.utils.data_classes import LidarPointCloud
-
-        token = sample["data"]["LIDAR_TOP"]
-        sd = self.nusc.get("sample_data", token)
-        cs = self.nusc.get("calibrated_sensor", sd["calibrated_sensor_token"])
-        pc = LidarPointCloud.from_file(self.nusc.get_sample_data_path(token))
-        pts = pc.points[:3].T.astype(np.float64)
+        pc = LidarPointCloud.from_file(info["lidar_path"])
         # Le lidar est capturé au timestamp de référence : lidar -> ego suffit.
-        return transform_points(
-            pts, Quaternion(cs["rotation"]).rotation_matrix, np.asarray(cs["translation"], dtype=np.float64)
-        )
+        return transform_points(pc.points[:3].T.astype(np.float64), info["lidar_R"], info["lidar_t"])
 
     # ==============================================================
     # Annotations
     # ==============================================================
 
-    def get_annotations(self, sample: Dict, R_ref_global, t_ref_global):
-        """
-        Retourne toutes les annotations des classes suivies, avec les
-        champs utiles au filtrage ET à l'audit.
-        """
-        R_glb_ref = R_ref_global.T
+    def get_annotations(self, info: Dict):
+        """Annotations des classes suivies, avec les champs utiles au filtrage ET à l'audit."""
+        R_glb_ref = info["ref_R"].T
         out = []
-        for token in sample["anns"]:
-            ann = self.nusc.get("sample_annotation", token)
-            name = map_category(ann["category_name"])
-            if name is None or name not in self.class_to_idx:
-                continue
-
-            center = R_glb_ref @ (np.asarray(ann["translation"], dtype=np.float64) - t_ref_global)
-            R_box = R_glb_ref @ Quaternion(ann["rotation"]).rotation_matrix
+        for name, row in zip(info["ann_names"], info["ann"]):
+            center = R_glb_ref @ (row[0:3] - info["ref_t"])
+            R_box = R_glb_ref @ Quaternion(row[3:7]).rotation_matrix
             yaw = math.atan2(R_box[1, 0], R_box[0, 0])
-            w, l, h = (float(v) for v in ann["size"])   # nuScenes : [w, l, h]
-
-            vis = ann.get("visibility_token", "4")
+            w, l, h = (float(v) for v in row[7:10])   # nuScenes : [w, l, h]
             out.append({
                 "name": name,
                 "label": self.class_to_idx[name],
                 "box": [float(center[0]), float(center[1]), float(center[2]), l, w, h, yaw],
-                "num_pts": int(ann.get("num_lidar_pts", 1)) + int(ann.get("num_radar_pts", 0)),
-                "visibility": int(vis) if str(vis).isdigit() else 4,
+                "num_pts": int(row[10]),
+                "visibility": int(row[11]),
                 "distance": float(math.hypot(center[0], center[1])),
             })
         return out
@@ -198,8 +271,8 @@ class NuScenesLSSDataset(Dataset):
             return False
         return True
 
-    def get_gt(self, sample: Dict, R_ref_global, t_ref_global):
-        anns = [a for a in self.get_annotations(sample, R_ref_global, t_ref_global) if self.keep_annotation(a)]
+    def get_gt(self, info: Dict):
+        anns = [a for a in self.get_annotations(info) if self.keep_annotation(a)]
         if not anns:
             return torch.zeros((0, 7), dtype=torch.float32), torch.zeros((0,), dtype=torch.long)
         boxes = torch.tensor([a["box"] for a in anns], dtype=torch.float32)
@@ -211,7 +284,7 @@ class NuScenesLSSDataset(Dataset):
     # ==============================================================
 
     def __getitem__(self, index: int):
-        sample = self.samples[index]
+        info = self.infos[index]
         augment = self.training and not self.disable_augmentation
 
         # Graine dérivée du RNG torch : DataLoader la rend différente par
@@ -219,16 +292,14 @@ class NuScenesLSSDataset(Dataset):
         rng = np.random.default_rng(int(torch.randint(0, 2**31 - 1, (1,)).item()))
         self.image_aug.training = augment
 
-        R_ref_global, t_ref_global = self.get_reference_pose(sample)
-        lidar_ref = self.get_lidar_points_reference(sample) if self.use_lidar_depth else None
+        lidar_ref = self.get_lidar_points_reference(info) if self.use_lidar_depth else None
 
         images, intrins, rots, trans, post_rots, post_trans, depth_bins = [], [], [], [], [], [], []
 
-        for cam in self.cameras:
-            token = sample["data"][cam]
-            R_cam_ref, t_cam_ref, K = self.get_camera_to_reference(token, R_ref_global, t_ref_global)
+        for k in range(len(self.cameras)):
+            R_cam_ref, t_cam_ref, K = self.get_camera_to_reference(info, k)
 
-            image = Image.open(self.nusc.get_sample_data_path(token))
+            image = Image.open(info["cams"][k]["path"])
             img, post_rot, post_tran = self.image_aug(image, rng)
 
             images.append(img)
@@ -249,7 +320,7 @@ class NuScenesLSSDataset(Dataset):
             else:
                 depth_bins.append(torch.full(C.FEATURE_SIZE, -1, dtype=torch.long))
 
-        gt_boxes, gt_labels = self.get_gt(sample, R_ref_global, t_ref_global)
+        gt_boxes, gt_labels = self.get_gt(info)
         bda, _ = sample_bda(rng, C.BDA, training=augment)
         gt_boxes = apply_bda_to_boxes(gt_boxes, bda)
 
@@ -264,5 +335,5 @@ class NuScenesLSSDataset(Dataset):
             "depth_bins": torch.stack(depth_bins),
             "gt_boxes": gt_boxes,
             "gt_labels": gt_labels,
-            "sample_token": sample["token"],
+            "sample_token": info["token"],
         }
