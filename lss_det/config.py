@@ -70,6 +70,16 @@ MIN_VISIBILITY_LEVEL = 1
 # sont gardées ; le nombre retenu est affiché à la construction du dataset.
 REQUIRE_AVAILABLE_FILES = True
 
+# Miroir COHÉRENT (v2.2), entraînement uniquement : un seul tirage par frame.
+# Avec la probabilité MIRROR_PROB, les 6 images sont retournées
+# horizontalement ET le monde BEV est miroité ; sinon, ni l'un ni l'autre.
+# Cela équivaut à filmer un monde miroité avec des caméras normales :
+# l'apparence des objets reste cohérente avec leur orientation cible.
+# Quand MIRROR_PROB n'est pas None, IMG_AUG["rand_flip"] et
+# BDA["flip_x_prob"/"flip_y_prob"] sont IGNORÉS.
+# None = ancien comportement (miroirs indépendants : bloque l'orientation).
+MIRROR_PROB = 0.5
+
 # ==================================================================
 # Image / caméra
 # ==================================================================
@@ -157,11 +167,11 @@ DECODER_SCORE_THRESHOLD = 0.05
 # Rayon de circle-NMS par classe (mètres), ordre de grandeur CenterPoint.
 NMS_RADIUS = {
     "car": 2.0,
-    "truck": 3.5,
+    "truck": 2.5,
     "bus": 3.5,
     "pedestrian": 0.5,
-    "bicycle": 0.9,
-    "motorcycle": 0.9,
+    "bicycle": 0.6,
+    "motorcycle": 0.6,
 }
 
 # ==================================================================
@@ -169,7 +179,7 @@ NMS_RADIUS = {
 # ==================================================================
 
 SEED = 42
-EPOCHS = 24
+EPOCHS = 10
 BATCH_SIZE = 1
 ACCUM_STEPS = 8               # batch effectif = BATCH_SIZE * ACCUM_STEPS
 NUM_WORKERS = 4
@@ -189,7 +199,7 @@ OVERFIT_NUM_SAMPLES = 0
 OVERFIT_EPOCHS = 150
 OVERFIT_WARMUP_STEPS = 50
 OVERFIT_EVAL_EVERY = 25
-CHECKPOINT_DIR = "checkpoints_part01"
+CHECKPOINT_DIR = "checkpoints_full"
 
 
 # ==================================================================
@@ -229,6 +239,9 @@ def validate():
 
     if len(BBOX_CODE_WEIGHTS) != 8:
         errors.append("BBOX_CODE_WEIGHTS doit contenir 8 valeurs.")
+
+    if MIRROR_PROB is not None and not 0.0 <= MIRROR_PROB <= 1.0:
+        errors.append("MIRROR_PROB doit être None ou dans [0, 1].")
 
     if ACCUM_STEPS < 1 or BATCH_SIZE < 1:
         errors.append("BATCH_SIZE et ACCUM_STEPS doivent être >= 1.")

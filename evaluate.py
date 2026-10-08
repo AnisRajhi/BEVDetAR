@@ -9,6 +9,8 @@ rappel par tranche de distance, et qualité de la profondeur prédite
 (dAcc = argmax à ±1 bin du lidar, dRel = erreur relative de E[d]).
 """
 
+import sys
+
 import torch
 from torch.utils.data import DataLoader
 
@@ -22,11 +24,14 @@ from lss_det.metrics.detection_metrics import format_report
 from lss_det.models.lss_detector import LSSDetector
 from lss_det.targets.centerpoint_targets import CenterPointTargetBuilder
 
-CHECKPOINT = "checkpoints/best_map.pt"
+CHECKPOINT = "checkpoints_part010203/reference_v231_part010203.pt"
 SPLIT = "val"
 
 
 def main():
+    # Affiche chaque ligne immédiatement, même à travers `| tee` (sinon Python
+    # retient ~8 Ko de sortie et l'entraînement semble bloqué).
+    sys.stdout.reconfigure(line_buffering=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(CHECKPOINT, map_location="cpu", weights_only=False)
 

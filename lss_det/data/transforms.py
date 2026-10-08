@@ -86,13 +86,20 @@ class LSSImageAugmentation:
     # Tirage des paramètres
     # --------------------------------------------------------------
 
-    def sample_params(self, W: int, H: int, rng: np.random.Generator) -> Dict:
+    def sample_params(self, W: int, H: int, rng: np.random.Generator, force_flip: Optional[bool] = None) -> Dict:
+        """
+        force_flip : None = tirage indépendant (IMG_AUG["rand_flip"]) ;
+                     True/False = imposé par le miroir cohérent de la frame (dataset).
+        """
         base = max(self.fW / W, self.fH / H)
 
         if self.training:
             resize = base * rng.uniform(*self.aug.get("resize_lim", (1.0, 1.0)))
             bot_pct = rng.uniform(*self.aug.get("bot_pct_lim", (0.0, 0.0)))
-            flip = bool(self.aug.get("rand_flip", False)) and bool(rng.random() < 0.5)
+            if force_flip is not None:
+                flip = bool(force_flip)
+            else:
+                flip = bool(self.aug.get("rand_flip", False)) and bool(rng.random() < 0.5)
             rotate = float(rng.uniform(*self.aug.get("rot_lim", (0.0, 0.0))))
         else:
             resize = base
@@ -171,11 +178,26 @@ class LSSImageAugmentation:
             image = image.rotate(params["rotate"], resample=_BILINEAR)
         return image
 
-    def __call__(self, image: Image.Image, rng: np.random.Generator):
-        image = image.convert("RGB")
-        params = self.sample_params(image.size[0], image.size[1], rng)
-        post_rot, post_trans = self.compute_post_transform(image.size, params)
-        image = self.apply_to_image(image, params)
+    def geometric(self, image: Image.Image, params: Dict) -> Image.Image:
+        """
+        Décodage + transformations géométriques.
+
+        v2.3 : image.draft() demande au décodeur JPEG de décoder directement
+        à 1/2 (ou 1/4…) de la taille, sans descendre sous la taille du
+        resize. Le décodage et le resize deviennent plusieurs fois plus
+        rapides (le CPU était le goulot : GPU ~20 %). La géométrie ne change
+        pas : la réduction JPEG est un facteur exact, et le resize qui suit
+        vise les mêmes dimensions finales (testé à moins de 0,2 px près).
+        Sans effet sur les images non JPEG.
+        """
+        image.draft("RGB", params["resize_dims"])
+        return self.apply_to_image(image.convert("RGB"), params)
+
+    def __call__(self, image: Image.Image, rng: np.random.Generator, force_flip: Optional[bool] = None):
+        original_size = image.size          # lue dans l'en-tête, avant décodage
+        params = self.sample_params(original_size[0], original_size[1], rng, force_flip)
+        post_rot, post_trans = self.compute_post_transform(original_size, params)
+        image = self.geometric(image, params)
 
         if self.training and self.color_jitter is not None:
             image = self.color_jitter(image)

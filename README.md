@@ -71,6 +71,8 @@ sinon chacun des `NUM_WORKERS` processus pourrait finir par en dupliquer la mém
 | `tests/test_audit_and_engine.py` | audit + moteur train/eval |
 | `tests/test_heatmap_learnability.py` | garde-fou contre le piège « ReLU morte » de la heatmap |
 | `tests/test_available_files.py` | partie de trainval : fichiers absents, NuScenes partagé puis libéré |
+| `tests/test_mirror_consistency.py` | miroir cohérent : apparence compatible avec l'orientation cible |
+| `tests/test_alignment_and_decoding.py` | alignement des ré-agrandissements, décodage JPEG réduit |
 | `tests/__init__.py`, `lss_det/{data,decoding,losses,metrics,targets,visualization}/__init__.py` | packages |
 
 **Réécrits** (remplacer le fichier entier) :
@@ -130,6 +132,44 @@ sigmoid(−2,19) = 0,10. Mesuré sur BEV 128×128 avec un signal objet évident,
 | défaut PyTorch (v2) | 0,17 / 0,28 / 0,39 / 0,53 / 0,62 |
 
 `tests/test_heatmap_learnability.py` échoue avec l'ancienne init et passe avec la nouvelle.
+
+## Miroir cohérent (v2.2)
+
+En v2 / v2.1, l'image de chaque caméra était retournée au hasard (50 %) et le monde BEV
+miroité au hasard, **indépendamment**. Une voiture retournée dans l'image paraît aller dans
+l'autre sens : dans ~50 % des exemples, l'apparence contredisait l'orientation cible, et la
+tête rot n'apprenait rien (loss figée à 1,21 sur 24 epochs ; sans miroirs : 1,21 → 0,92 en
+13 epochs). Désormais, `MIRROR_PROB` tire **un seul** miroir par frame : les 6 images ET le
+monde BEV, ensemble. C'est ce que verraient des caméras normales filmant un monde miroité,
+donc tout reste cohérent, et on garde la régularisation des miroirs pour la détection.
+`tests/test_mirror_consistency.py` vérifie que, pour chaque caméra, l'application
+pixel → BEV garde la même orientation (déterminant positif) qu'une caméra non augmentée.
+
+### v2.3.1 : miroir gauche ↔ droite uniquement
+
+Le run v2.3 a montré que la cohérence image/monde ne suffisait pas : la loss rot restait figée
+(1,21) comme en v2.1. Point commun des deux runs bloqués : dans ~50 % des frames, la BDA
+faisait un miroir X ou un retournement de 180°, qui fait pointer l'avant de l'ego vers −x et
+inverse le cap de toutes les cibles. Le run sans aucun miroir n'en avait pas, et c'est le seul
+où l'orientation apprenait. Désormais, le miroir cohérent est un miroir y → −y uniquement
+(plus les 6 images retournées) : l'avant de l'ego reste vers +x.
+
+## Alignement spatial et chargement plus rapide (v2.3)
+
+- **Ré-agrandissements alignés.** Le BEV backbone (×4 puis ×2) et la fusion caméra (r5 → r4)
+  utilisaient `F.interpolate(..., align_corners=True)`, comme le LSS original. Avec des
+  convolutions centrées de stride 2, cela décale les features d'une quantité qui **dépend de
+  la position** dans la grille : de 0 à ~0,9 case pour la branche fine, de ~0,7 à ~6 cases
+  (jusqu'à ~5 m) pour la branche contexte. Une convolution ne peut pas compenser un décalage
+  variable : localisation floue (AP à 0,5 m ≈ 0, tête `reg` bloquée). `upsample_aligned()`
+  lit exactement la position j / s : décalage nul partout (`tests/test_alignment_and_decoding.py`).
+- **Décodage JPEG réduit.** `image.draft()` décode directement à 1/2 de la taille : environ
+  35 % de temps en moins par image, géométrie identique (testée à moins de 0,2 px).
+- **Affichage immédiat** : `train.py` et `evaluate.py` écrivent chaque ligne tout de suite,
+  même à travers `| tee`.
+
+Les checkpoints antérieurs à la v2.3 ne sont pas compatibles en pratique (mêmes poids, mais
+features alignées différemment) : réentraîner.
 
 ## Lire les logs
 

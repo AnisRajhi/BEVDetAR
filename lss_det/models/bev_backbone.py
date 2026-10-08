@@ -43,6 +43,33 @@ def make_group_norm(
 # Residual Block
 # ==============================================================
 
+
+def upsample_aligned(x: torch.Tensor, size) -> torch.Tensor:
+    """
+    Ré-agrandissement bilinéaire ALIGNÉ sur des convolutions centrées de
+    stride 2 (sortie i <-> entrée 2i) : la case j de sortie lit exactement
+    la position j / s de l'entrée (s = facteur entier).
+
+    v2.3 : remplace F.interpolate(..., align_corners=True), qui lit la
+    position j·(n_in−1)/(n_out−1). L'écart avec j / s grandit avec j : les
+    features se retrouvaient décalées de 0 à ~0,9 case (branche fine) et de
+    ~0,7 à ~6 cases (branche contexte) SELON LA POSITION dans la grille.
+    Une convolution applique la même opération partout : elle ne peut pas
+    compenser un décalage qui dépend de la position. D'où une localisation
+    floue (AP à 0,5 m ≈ 0, tête reg bloquée au niveau d'une constante).
+
+    Astuce : on ajoute une ligne/colonne répliquée à la fin, on agrandit
+    avec align_corners=True vers (n_in·s + 1) puis on recadre à n_in·s ;
+    la case j lit alors j·(n_in + 1 − 1)/(n_in·s + 1 − 1) = j / s.
+    """
+    H, W = x.shape[-2:]
+    oh, ow = int(size[0]), int(size[1])
+    if oh % H or ow % W:
+        raise ValueError(f"upsample_aligned : {tuple(size)} n'est pas un multiple de {(H, W)}")
+    x = F.pad(x, (0, 1, 0, 1), mode="replicate")
+    x = F.interpolate(x, size=(oh + 1, ow + 1), mode="bilinear", align_corners=True)
+    return x[..., :oh, :ow]
+
 class BasicBlock(nn.Module):
     """
     ResNet-like residual block.
@@ -543,18 +570,7 @@ class BEVBackbone(nn.Module):
         # Deep feature → x1 resolution
         # ======================================================
 
-        x3_up = F.interpolate(
-
-            x3,
-
-            size=x1.shape[
-                -2:
-            ],
-
-            mode="bilinear",
-
-            align_corners=True,
-        )
+        x3_up = upsample_aligned(x3, x1.shape[-2:])
 
         # ======================================================
         # Skip fusion
@@ -578,16 +594,7 @@ class BEVBackbone(nn.Module):
         # Back to original BEV resolution
         # ======================================================
 
-        x = F.interpolate(
-
-            x,
-
-            size=input_size,
-
-            mode="bilinear",
-
-            align_corners=True,
-        )
+        x = upsample_aligned(x, input_size)
 
         x = self.output_block(
             x

@@ -27,13 +27,37 @@ C'est exact et gratuit (aucun pixel rééchantillonné).
 """
 
 import math
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
 
 
-def sample_bda(rng: np.random.Generator, cfg: Dict, training: bool) -> Tuple[torch.Tensor, Dict]:
+def sample_bda(rng: np.random.Generator, cfg: Dict, training: bool,
+               mirror: Optional[bool] = None) -> Tuple[torch.Tensor, Dict]:
+    """
+    mirror : None = miroirs X et Y tirés indépendamment (cfg["flip_*_prob"]).
+             True/False = miroir cohérent imposé par la frame : miroir Y seul
+             (gauche <-> droite) si mirror, rien sinon.
+
+    v2.3.1 — mesuré sur la partie 1 de trainval : l'orientation n'apprend que
+    si l'avant de l'ego reste orienté vers +x dans la grille BEV. Un miroir X
+    ou un retournement de 180° (présents dans ~50 % des frames en v2.1 et en
+    v2.3) inverse le cap de toutes les cibles : loss rot figée à 1,21, avec
+    ou sans cohérence image/monde. Sans ces retournements : 1,21 -> 1,11 en
+    5 epochs. Le miroir Y garde l'avant vers +x.
+
+    Pourquoi la parité doit suivre le retournement des images
+    ---------------------------------------------------------
+    Retourner une image change l'apparence d'un objet en son image miroir
+    (une voiture « vers la droite » paraît aller « vers la gauche »).
+    Si le monde BEV n'est pas miroité en même temps, la cible d'orientation
+    contredit l'apparence : sur la moitié des exemples, l'indice d'orientation
+    le plus direct devient faux et la tête rot n'apprend rien (mesuré :
+    loss rot figée à 1,21 pendant 24 epochs). Retourner TOUTES les images ET
+    miroiter le monde ensemble équivaut à filmer un monde miroité avec une
+    caméra normale : tout reste cohérent.
+    """
     if not training:
         return torch.eye(3, dtype=torch.float32), {
             "rot_deg": 0.0, "scale": 1.0, "flip_x": False, "flip_y": False,
@@ -42,9 +66,14 @@ def sample_bda(rng: np.random.Generator, cfg: Dict, training: bool) -> Tuple[tor
     params = {
         "rot_deg": float(rng.uniform(*cfg["rot_lim"])),
         "scale": float(rng.uniform(*cfg["scale_lim"])),
-        "flip_x": bool(rng.random() < cfg["flip_x_prob"]),
-        "flip_y": bool(rng.random() < cfg["flip_y_prob"]),
+        # Miroir cohérent : miroir GAUCHE <-> DROITE uniquement (y -> -y). Jamais de
+        # miroir X ni de 180° : ils retournent l'axe « avant » de l'ego dans la
+        # grille BEV et inversent le cap de toutes les cibles (v2.3.1).
+        "flip_x": bool(rng.random() < cfg["flip_x_prob"]) if mirror is None else False,
+        "flip_y": None,
     }
+    params["flip_y"] = (bool(rng.random() < cfg["flip_y_prob"]) if mirror is None
+                        else params["flip_x"] != bool(mirror))
     return build_bda_matrix(**params), params
 
 

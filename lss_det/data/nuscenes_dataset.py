@@ -292,6 +292,11 @@ class NuScenesLSSDataset(Dataset):
         rng = np.random.default_rng(int(torch.randint(0, 2**31 - 1, (1,)).item()))
         self.image_aug.training = augment
 
+        # Miroir cohérent : un seul tirage pour les 6 images ET le monde BEV.
+        mirror = None
+        if augment and C.MIRROR_PROB is not None:
+            mirror = bool(rng.random() < C.MIRROR_PROB)
+
         lidar_ref = self.get_lidar_points_reference(info) if self.use_lidar_depth else None
 
         images, intrins, rots, trans, post_rots, post_trans, depth_bins = [], [], [], [], [], [], []
@@ -300,7 +305,7 @@ class NuScenesLSSDataset(Dataset):
             R_cam_ref, t_cam_ref, K = self.get_camera_to_reference(info, k)
 
             image = Image.open(info["cams"][k]["path"])
-            img, post_rot, post_tran = self.image_aug(image, rng)
+            img, post_rot, post_tran = self.image_aug(image, rng, force_flip=mirror)
 
             images.append(img)
             intrins.append(torch.from_numpy(K).float())
@@ -321,7 +326,7 @@ class NuScenesLSSDataset(Dataset):
                 depth_bins.append(torch.full(C.FEATURE_SIZE, -1, dtype=torch.long))
 
         gt_boxes, gt_labels = self.get_gt(info)
-        bda, _ = sample_bda(rng, C.BDA, training=augment)
+        bda, _ = sample_bda(rng, C.BDA, training=augment, mirror=mirror)
         gt_boxes = apply_bda_to_boxes(gt_boxes, bda)
 
         return {

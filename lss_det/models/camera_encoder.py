@@ -23,6 +23,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from efficientnet_pytorch import EfficientNet
 
+from lss_det.models.bev_backbone import upsample_aligned
+
 
 def make_group_norm(num_channels: int) -> nn.GroupNorm:
     for g in (32, 16, 8, 4, 2, 1):
@@ -46,7 +48,10 @@ class FeatureFusion(nn.Module):
         )
 
     def forward(self, r4, r5):
-        r5 = F.interpolate(r5, size=r4.shape[-2:], mode="bilinear", align_corners=True)
+        # v2.3 : ré-agrandissement aligné (voir bev_backbone.upsample_aligned) ;
+        # avec align_corners=True, le décalage r5/r4 dépendait de la position
+        # dans l'image (jusqu'à ~1 cellule sur les bords droit et bas).
+        r5 = upsample_aligned(r5, r4.shape[-2:])
         return self.net(torch.cat([r4, r5], dim=1))
 
 

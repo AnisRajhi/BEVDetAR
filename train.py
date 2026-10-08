@@ -23,6 +23,8 @@ import os
 import time
 from pathlib import Path
 
+import sys
+
 import torch
 from torch.utils.data import DataLoader, Subset
 
@@ -39,6 +41,9 @@ from lss_det.targets.centerpoint_targets import CenterPointTargetBuilder
 
 
 def main():
+    # Affiche chaque ligne immédiatement, même à travers `| tee` (sinon Python
+    # retient ~8 Ko de sortie et l'entraînement semble bloqué).
+    sys.stdout.reconfigure(line_buffering=True)
     seed_everything(C.SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt_dir = Path(C.CHECKPOINT_DIR)
